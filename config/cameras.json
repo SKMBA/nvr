@@ -1,0 +1,24 @@
+{
+    "Tapo": {
+        "name": "Bed Room",
+        "url": "rtsp://admins:admins25@192.168.100.10:554/stream1",
+        "width": 1920,
+        "height": 1080,
+        "fps": 15,
+        "recording_mode": "motion",
+        "output_file": "recordings/cam1/output.mp4",
+        "threshold": 40,
+        "area": 500
+    },
+    "cam2": {
+        "name": "Backyard",
+        "url": "rtsp://rtspstream:_KiZLvSPFxLJ-74lXvu0g@zephyr.rtsp.stream/traffic",
+        "width": 1920,
+        "height": 1080,
+        "fps": 15,
+        "recording_mode": "motion",
+        "output_file": "recordings/cam2/output.mp4",
+        "threshold": 45,
+        "area": 600
+    }
+}

@@ -1,0 +1,13 @@
+{
+  "logging": {
+    "name": "LOGGER",  
+    "folder": "test_logs",
+    "file": "logger.log",
+    "level": "DEBUG",
+    "console_enabled": true,
+    "file_enabled": true,
+    "format": "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
+    "datefmt": "%Y-%m-%d %H:%M:%S",
+    "max_queue_size": 500
+  }
+}

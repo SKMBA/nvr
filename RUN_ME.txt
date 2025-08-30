@@ -1,0 +1,116 @@
+INTEGRATED NVR RUN INSTRUCTIONS
+================================
+
+PHASE 1: Supervisor + Worker Architecture
+========================================
+
+Prerequisites:
+- Python 3.12 (Windows 10/11)
+- FFmpeg installed and in PATH
+- Camera streams accessible (RTSP URLs in config/cameras.json)
+
+Setup:
+------
+1. Install dependencies:
+   pip install -r requirements.txt
+
+2. Verify camera configuration:
+   - Edit config/cameras.json with your camera RTSP URLs
+   - Test camera connectivity: python -c "from core.camera_helper import CameraHelper; print(CameraHelper.get_all_camera_ids())"
+
+3. Create output directory:
+   mkdir output
+
+Run Commands:
+-------------
+# Start full NVR system (supervisor + all workers)
+python main.py
+
+# Run integration tests
+python -m pytest test_supervisor_integration.py -v
+
+# Test individual camera worker (debugging)
+python camera_worker.py Tapo
+
+# Health check (after starting main.py)
+curl http://localhost:5001/health
+curl http://localhost:5001/status
+
+Expected Behavior:
+------------------
+1. Supervisor starts and loads cameras from config/cameras.json
+2. One worker process spawned per camera
+3. Each worker handles:
+   - SUB stream: motion detection + preview (30 FPS)
+   - MAIN stream: FFmpeg recording triggered by motion
+4. Workers send heartbeat every 5 seconds
+5. Supervisor restarts crashed workers with exponential backoff
+6. Health API available at http://localhost:5001/health
+7. Recordings saved to output/ directory with timestamp
+
+Architecture:
+-------------
+Supervisor Process (main.py)
+├── WorkerManager (spawn/monitor workers)
+├── HealthAPI (Flask on port 5001)
+└── Workers (one per camera)
+    ├── SUB Stream Thread (motion detection)
+    ├── MAIN Stream Thread (recording)
+    ├── Heartbeat Thread (status updates)
+    └── Command Thread (supervisor commands)
+
+IPC:
+----
+- Supervisor → Worker: multiprocessing.Queue (commands)
+- Worker → Supervisor: multiprocessing.Queue (heartbeats/status)
+- Messages: JSON-serializable dataclasses with schema versioning
+
+Logs:
+-----
+- Structured JSON logs via core/logger_config.py
+- Per-worker correlation: camera_id in all log messages
+- Supervisor logs: worker lifecycle, restart events, health status
+- Worker logs: stream status, motion events, recording start/stop
+
+Performance Targets (Phase 1):
+------------------------------
+- Heartbeat latency: < 1 second
+- Worker restart time: < 30 seconds
+- Memory per worker: < 200MB
+- CPU per worker: < 10% (idle), < 25% (recording)
+- Motion detection latency: < 100ms
+- Recording start latency: < 2 seconds
+
+Troubleshooting:
+---------------
+1. No cameras found:
+   - Check config/cameras.json format
+   - Verify camera URLs are accessible
+
+2. Workers keep crashing:
+   - Check ffmpeg is in PATH
+   - Verify camera streams are stable
+   - Check output directory permissions
+
+3. No heartbeats:
+   - Check network connectivity to cameras
+   - Verify no firewall blocking RTSP ports
+
+4. Health API not responding:
+   - Check port 5001 is not in use
+   - Verify Flask dependencies installed
+
+Files Added:
+------------
+- supervisor.py (main supervisor process)
+- camera_worker.py (individual camera worker)
+- health_api.py (health monitoring API)
+- test_supervisor_integration.py (integration tests)
+
+Next Steps (Phase 2):
+--------------------
+- Web UI integration with worker status
+- Advanced recording policies (motion zones, schedules)
+- Metrics collection and storage
+- Multi-camera preview grid
+- PTZ command routing through supervisor
