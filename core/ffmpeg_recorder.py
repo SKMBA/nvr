@@ -5,6 +5,7 @@ import collections
 import queue 
 import cv2 
 from config .ui_constants import FFMPEG_LOG_FILE 
+from core.logger_config import logger
 class FFmpegRecorder :
     def __init__ (self ,url ,output_file ,pre_record_time ,fps ,frame_size ):
         self .url =url 
@@ -142,26 +143,86 @@ class FFmpegRecorder :
             except Exception as e :
                 print (f"[FFmpegRecorder] Writer error: {e }")
                 break 
-    def stop_recording (self ):
-        print ("SKM-core-ffmpeg_recorder.py-FFmpegRecorder.stop_recording()")
-        with self .lock :
-            if not self .recording :
-                return 
-            print ("[Recorder] Stopping recording...")
-            print (f"[Recorder] Stopping recording... Total dropped frames: {self .dropped_frames }")
-            self .recording =False 
-            self .stop_writer_event .set ()
-            if self .writer_thread :
-                self .writer_thread .join (timeout =2 )
-                self .writer_thread =None 
-            try :
-                if self .process and self .process .stdin :
-                    self .process .stdin .close ()
-                self .process .wait (timeout =10 )
-            except Exception as e :
-                print (f"[Recorder] Error stopping FFmpeg: {e }")
-            finally :
-                self .process =None 
+
+    # ffmpeg_recorder.py - Updated stop_recording() method only
+    def stop_recording(self):
+        """Stop FFmpeg recording with graceful shutdown."""
+        print("SKM-core-ffmpeg_recorder.py-FFmpegRecorder.stop_recording()")
+        with self.lock:
+            if not self.recording:
+                return
+                
+            logger.debug("[Recorder] Stopping recording...")
+            logger.debug(f"[Recorder] Stopping recording... Total dropped frames: {self.dropped_frames}")
+            
+            # Mark as not recording first
+            self.recording = False
+            
+            # Stop writer thread
+            self.stop_writer_event.set()
+            if self.writer_thread:
+                self.writer_thread.join(timeout=2)
+                self.writer_thread = None
+                
+            # Graceful FFmpeg shutdown
+            try:
+                if self.process and self.process.poll() is None:  # Process still running
+                    logger.debug("[Recorder] Sending 'q' command to FFmpeg for graceful shutdown...")
+                    
+                    try:
+                        # Send 'q' command for graceful shutdown
+                        self.process.stdin.write(b'q\n')
+                        self.process.stdin.flush()
+                        logger.debug("[Recorder] 'q' command sent, waiting for FFmpeg to finish...")
+                        
+                        # Wait for graceful shutdown (up to 10 seconds)
+                        exit_code = self.process.wait(timeout=10)
+                        logger.info(f"[Recorder] FFmpeg finished gracefully with exit code: {exit_code}")
+                        
+                    except subprocess.TimeoutExpired:
+                        logger.warning("[Recorder] Graceful shutdown timeout, terminating FFmpeg...")
+                        self.process.terminate()
+                        
+                        try:
+                            # Wait for termination
+                            exit_code = self.process.wait(timeout=5)
+                            logger.debug(f"[Recorder] FFmpeg terminated with exit code: {exit_code}")
+                        except subprocess.TimeoutExpired:
+                            logger.debug("[Recorder] Termination timeout, force killing FFmpeg...")
+                            self.process.kill()
+                            self.process.wait()  # This should not timeout after kill
+                            logger.error("[Recorder] FFmpeg force killed")
+                            
+                    except BrokenPipeError:
+                        # FFmpeg already closed - this is normal
+                        logger.error("[Recorder] FFmpeg already closed (broken pipe)")
+                        self.process.wait(timeout=5)
+                        
+                    except Exception as e:
+                        logger.error(f"[Recorder] Error during graceful shutdown: {e}")
+                        # Fallback to termination
+                        try:
+                            self.process.terminate()
+                            self.process.wait(timeout=5)
+                        except:
+                            self.process.kill()
+                            self.process.wait()
+                            
+                    finally:
+                        # Always close stdin to prevent resource leaks
+                        try:
+                            if self.process.stdin:
+                                self.process.stdin.close()
+                        except:
+                            pass
+                            
+            except Exception as e:
+                logger.critical(f"[Recorder] Error stopping FFmpeg: {e}")
+                
+            finally:
+                self.process = None
+                logger.info("[Recorder] Recording stopped successfully")
+
 def get_dropped_frames (self ):
     return self .dropped_frames 
 def reset_dropped_frames (self ):
