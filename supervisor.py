@@ -13,6 +13,7 @@ import os
 
 from core.logger_config import logger
 from core.camera_helper import CameraHelper
+from core.config_validator import ConfigValidator, ConfigValidationError
 
 
 class WorkerState(Enum):
@@ -68,9 +69,30 @@ class WorkerManager:
         """Start the worker manager and monitoring thread."""
         logger.info("Starting WorkerManager...")
         
-        # Load camera configurations
-        camera_ids = CameraHelper.get_all_camera_ids()
-        logger.info(f"Found {len(camera_ids)} cameras: {camera_ids}")
+        # # Load camera configurations
+        # camera_ids = CameraHelper.get_all_camera_ids()
+        # logger.info(f"Found {len(camera_ids)} cameras: {camera_ids}")
+        
+        try:
+            # Load and validate camera configurations
+            from core.camera_helper import CameraHelper
+            cameras = CameraHelper._load_cameras()
+            
+            # NEW: Validate all camera configurations
+            logger.info("Validating camera configurations...")
+            validated_cameras = ConfigValidator.validate_all_cameras(cameras)
+            ConfigValidator.print_validation_summary(validated_cameras)
+            
+            # Use validated camera IDs
+            camera_ids = list(validated_cameras.keys())
+            logger.info(f"Found {len(camera_ids)} valid cameras: {camera_ids}")
+            
+        except ConfigValidationError as e:
+            logger.error(f"Camera configuration validation failed: {e}")
+            raise  # Stop startup if configuration is invalid
+        except Exception as e:
+            logger.error(f"Error loading camera configurations: {e}")
+            raise
         
         # Initialize workers for each camera
         for camera_id in camera_ids:

@@ -1,6 +1,6 @@
 {
   "logging": {
-    "name": "LOGGER",  
+    "name": "nvr_logger",  
     "folder": "test_logs",
     "file": "logger.log",
     "level": "DEBUG",

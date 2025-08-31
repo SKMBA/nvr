@@ -86,7 +86,7 @@ def setup_logger(config: Union[dict, Any]) -> logging.Logger:
 
 # Initialize logger using AppConfig
 try:
-    app_config = AppConfig(str(Path("config\\app_config_logger.json").resolve()))
+    app_config = AppConfig(str(Path("config\\app_config.json").resolve()))
     config_obj = app_config.get_config()
     logger = setup_logger(config_obj)
     

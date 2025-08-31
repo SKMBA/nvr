@@ -372,6 +372,9 @@ class CameraWorker:
 
 # For testing/debugging - can run worker standalone
 if __name__ == "__main__":
+    #
+    # Usage: python -m core.config_validator
+    #
     import sys
     
     if len(sys.argv) < 2:
