@@ -1,4 +1,4 @@
-# camera_worker.py
+# camera_worker.py - Complete file with thread-safe recording state management
 import threading
 import time
 import signal
@@ -21,6 +21,10 @@ from supervisor import HeartbeatMessage, CommandMessage
 class CameraWorker:
     """Camera worker process that handles SUB stream (preview + motion) and MAIN stream (recording)."""
     
+    
+    # camera_worker.py - Motion Trigger Race Condition Fix
+
+    # 1. UPDATED __init__ METHOD - Add motion trigger state tracking
     def __init__(self, camera_id: str, cmd_queue: mp.Queue, status_queue: mp.Queue):
         self.camera_id = camera_id
         self.cmd_queue = cmd_queue
@@ -37,7 +41,6 @@ class CameraWorker:
         
         # State
         self.running = True
-        self.recording = False
         self.motion_detected = False
         self.last_fps = 0.0
         self.error_message: Optional[str] = None
@@ -48,18 +51,67 @@ class CameraWorker:
         self.heartbeat_thread: Optional[threading.Thread] = None
         self.command_thread: Optional[threading.Thread] = None
         
-        # Synchronization
-        self.lock = threading.Lock()
+        # Enhanced synchronization for recording state
+        self.lock = threading.RLock()  # Use RLock for nested locking
         self.recording_event = threading.Event()
         self.stop_recording_event = threading.Event()
         
+        # Private recording state (always access through methods)
+        self._recording = False
+        self._recording_start_time = None
+        
+        # Motion trigger state management (NEW - prevents duplicate triggers)
+        self.motion_start_time: Optional[float] = None
+        self.motion_trigger_sent = False  # Track if recording event already triggered
+        self.last_motion_trigger_time = 0.0  # Debounce rapid triggers
+        self.motion_trigger_cooldown = 2.0  # Minimum seconds between triggers
+        
         # Recording
         self.recorder: Optional[FFmpegRecorder] = None
-        self.motion_start_time: Optional[float] = None
         self.motion_timeout = self.camera_config.get('motion_timeout', 1.5)
         self.post_record_time = self.camera_config.get('post_record_time', 5.0)
         
         logger.info(f"CameraWorker initialized for {camera_id}")
+        
+    # Thread-safe recording state access methods
+    def _is_recording(self) -> bool:
+        """Thread-safe check if currently recording."""
+        with self.lock:
+            return self._recording
+    
+    def _set_recording_state(self, recording: bool) -> bool:
+        """
+        Thread-safe recording state change.
+        
+        Returns:
+            True if state changed, False if already in that state
+        """
+        with self.lock:
+            if self._recording == recording:
+                return False  # No change needed
+                
+            old_state = self._recording
+            self._recording = recording
+            
+            if recording:
+                self._recording_start_time = time.time()
+            else:
+                self._recording_start_time = None
+                
+            logger.debug(f"Recording state change for {self.camera_id}: {old_state} -> {recording}")
+            return True
+    
+    def _get_recording_duration(self) -> float:
+        """Get current recording duration in seconds."""
+        with self.lock:
+            if self._recording and self._recording_start_time:
+                return time.time() - self._recording_start_time
+            return 0.0
+
+    # Property for backward compatibility
+    @property 
+    def recording(self) -> bool:
+        return self._is_recording()
         
     @classmethod
     def run(cls, camera_id: str, cmd_queue: mp.Queue, status_queue: mp.Queue):
@@ -129,60 +181,72 @@ class CameraWorker:
                 
         logger.info(f"Camera worker {self.camera_id} stopped")
         
-    # camera_worker.py - Enhance heartbeat to include recorder status
-
     def _heartbeat_loop(self):
-        """Send periodic heartbeat messages with recorder health status."""
+        """Send periodic heartbeat with thread-safe state access."""
         logger.info(f"Starting heartbeat loop for {self.camera_id}")
         
         while self.running:
             try:
+                # Thread-safe state collection
                 with self.lock:
-                    # Get recorder status if available
-                    recorder_status = None
-                    if self.recorder:
+                    current_recording = self._recording
+                    current_fps = self.last_fps
+                    current_error = self.error_message
+                    
+                # Get recorder status safely
+                recorder_status = None
+                if self.recorder:
+                    try:
                         recorder_status = self.recorder.get_recording_status()
-                    
-                    # Determine stream state with recorder health
-                    if self.error_message:
-                        stream_state = "error"
-                    elif self.recording:
-                        if recorder_status and recorder_status.get('failed'):
-                            stream_state = "recording_failed"
-                        else:
-                            stream_state = "recording"
-                    elif self.last_fps > 0:
-                        stream_state = "capturing"
+                    except Exception as e:
+                        logger.warning(f"Error getting recorder status: {e}")
+                
+                # Determine stream state
+                if current_error:
+                    stream_state = "error"
+                elif current_recording:
+                    if recorder_status and recorder_status.get('failed'):
+                        stream_state = "recording_failed"
                     else:
-                        stream_state = "idle"
+                        stream_state = "recording"
+                elif current_fps > 0:
+                    stream_state = "capturing" 
+                else:
+                    stream_state = "idle"
+                
+                # Create and send heartbeat
+                heartbeat = HeartbeatMessage(
+                    worker_id=self.camera_id,
+                    timestamp=datetime.now().isoformat(),
+                    stream_state=stream_state,
+                    fps=current_fps,
+                    recording=current_recording,
+                    error_message=current_error
+                )
+                
+                self.status_queue.put_nowait(asdict(heartbeat))
+                
+                # Debug logging with recording duration
+                if recorder_status:
+                    logger.debug(f"Heartbeat {self.camera_id}: {stream_state} (fps: {current_fps:.1f}, "
+                               f"duration: {self._get_recording_duration():.1f}s, "
+                               f"ffmpeg_restarts: {recorder_status.get('restart_count', 0)})")
+                else:
+                    logger.debug(f"Heartbeat {self.camera_id}: {stream_state} (fps: {current_fps:.1f})")
                     
-                    # Enhanced heartbeat message
-                    heartbeat = HeartbeatMessage(
-                        worker_id=self.camera_id,
-                        timestamp=datetime.now().isoformat(),
-                        stream_state=stream_state,
-                        fps=self.last_fps,
-                        recording=self.recording,
-                        error_message=self.error_message
-                    )
+                # Clear transient error messages after sending
+                if current_error and not current_error.startswith("Max connection failures"):
+                    with self.lock:
+                        if self.error_message == current_error:  # Only clear if unchanged
+                            self.error_message = None
                     
-                    self.status_queue.put_nowait(asdict(heartbeat))
-                    
-                    # Enhanced logging
-                    if recorder_status:
-                        logger.debug(f"Heartbeat {self.camera_id}: {stream_state} (fps: {self.last_fps:.1f}, "
-                                f"ffmpeg_restarts: {recorder_status.get('restart_count', 0)}, "
-                                f"dropped: {recorder_status.get('dropped_frames', 0)})")
-                    else:
-                        logger.debug(f"Heartbeat {self.camera_id}: {stream_state} (fps: {self.last_fps:.1f})")
-                        
             except queue.Full:
                 logger.warning(f"Status queue full for worker {self.camera_id}")
             except Exception as e:
                 logger.error(f"Error sending heartbeat from worker {self.camera_id}: {e}")
                 
-            time.sleep(5.0)
-
+            time.sleep(5.0)  # Heartbeat every 5 seconds
+            
     def _command_loop(self):
         """Process commands from supervisor."""
         logger.info(f"Starting command loop for {self.camera_id}")
@@ -219,8 +283,7 @@ class CameraWorker:
                 
         except Exception as e:
             logger.error(f"Error handling command {cmd_data}: {e}")
-
-    # camera_worker.py - Replace the _sub_stream_loop method
+            
     def _sub_stream_loop(self):
         """SUB stream thread - handles preview and motion detection with recovery."""
         logger.info(f"Starting SUB stream loop for {self.camera_id} (preview and motion detection)")
@@ -234,7 +297,7 @@ class CameraWorker:
         connection_failures = 0
         max_connection_failures = 5
         last_connection_attempt = 0
-        reconnection_delay = 5.0  # Start with 5 second delay
+        reconnection_delay = 5.0
         max_reconnection_delay = 60.0
         
         while self.running:
@@ -339,7 +402,7 @@ class CameraWorker:
                     time.sleep(1.0)  # Brief pause before reconnection
                     continue
                 
-                # Frame processing (existing logic)
+                # Frame processing
                 frame_count += 1
                 current_time = time.time()
                 
@@ -350,7 +413,7 @@ class CameraWorker:
                     frame_count = 0
                     last_fps_time = current_time
                 
-                # Motion detection
+                # Motion detection with atomic trigger logic
                 gray = preprocess_frame(frame)
                 if prev_frame is not None:
                     motion = detect_motion(
@@ -360,20 +423,40 @@ class CameraWorker:
                         self.camera_config.get('area', 500)
                     )
                     
+                    # Atomic motion trigger logic with proper synchronization
                     with self.lock:
                         self.motion_detected = motion
+                        currently_recording = self._recording
+                        current_time_for_motion = current_time
                         
-                    # Handle motion recording logic
-                    if motion:
-                        if not self.motion_start_time:
-                            self.motion_start_time = current_time
-                        elif current_time - self.motion_start_time >= self.motion_timeout:
-                            if not self.recording:
-                                logger.info(f"Motion confirmed for {self.camera_id}, starting recording")
-                                self.recording_event.set()
-                    else:
-                        self.motion_start_time = None
-                        
+                        # Handle motion recording logic
+                        if motion:
+                            # Start motion timer if not started
+                            if self.motion_start_time is None:
+                                self.motion_start_time = current_time_for_motion
+                                self.motion_trigger_sent = False  # Reset trigger flag
+                                logger.debug(f"Motion started for {self.camera_id}, waiting {self.motion_timeout}s for confirmation")
+                                
+                            # Check if motion has been confirmed for required duration
+                            elif (current_time_for_motion - self.motion_start_time >= self.motion_timeout and 
+                                not self.motion_trigger_sent and 
+                                not currently_recording):
+                                
+                                # Additional cooldown check to prevent rapid triggers
+                                if current_time_for_motion - self.last_motion_trigger_time >= self.motion_trigger_cooldown:
+                                    logger.info(f"Motion confirmed for {self.camera_id}, triggering recording")
+                                    self.recording_event.set()
+                                    self.motion_trigger_sent = True  # Mark trigger as sent
+                                    self.last_motion_trigger_time = current_time_for_motion
+                                else:
+                                    logger.debug(f"Motion trigger cooldown active for {self.camera_id}")
+                        else:
+                            # No motion detected - reset motion state
+                            if self.motion_start_time is not None:
+                                logger.debug(f"Motion ended for {self.camera_id}, resetting trigger state")
+                            self.motion_start_time = None
+                            self.motion_trigger_sent = False
+                
                 prev_frame = gray
                 
                 # Small delay to prevent CPU overload
@@ -396,12 +479,10 @@ class CameraWorker:
         if cap:
             cap.release()
             
-        logger.info(f"SUB stream loop stopped for {self.camera_id}")    
-
-    # camera_worker.py - Enhance _main_stream_loop to use recorder health status
-
+        logger.info(f"SUB stream loop stopped for {self.camera_id}")
+                
     def _main_stream_loop(self):
-        """MAIN stream thread - handles high-quality recording with health monitoring."""
+        """MAIN stream thread - handles recording with thread-safe coordination."""
         logger.info(f"Starting MAIN stream loop for {self.camera_id}")
         
         try:
@@ -409,25 +490,30 @@ class CameraWorker:
                 # Wait for recording trigger
                 if self.recording_event.wait(timeout=1.0):
                     self.recording_event.clear()
+                    
+                    # Start recording (state management handled internally)
                     self._start_recording()
                     
-                    # Record until stop signal or timeout
-                    start_time = time.time()
+                    # Record until stop signal or conditions met
                     while (self.running and 
-                        self.recording and 
-                        not self.stop_recording_event.wait(timeout=1.0)):
+                           self._is_recording() and  # Thread-safe check
+                           not self.stop_recording_event.wait(timeout=1.0)):
                         
-                        # Check if FFmpeg recording is still healthy
+                        # Check FFmpeg health
                         if self.recorder and not self.recorder.is_recording_healthy():
-                            logger.warning(f"FFmpeg recording failed for {self.camera_id}, stopping recording")
+                            logger.warning(f"FFmpeg recording failed for {self.camera_id}, stopping")
                             break
                         
-                        # Auto-stop recording after post_record_time if no motion
-                        if (not self.motion_detected and 
-                            time.time() - start_time > self.post_record_time):
-                            logger.info(f"Auto-stopping recording for {self.camera_id} (no motion)")
+                        # Auto-stop logic with thread-safe access
+                        recording_duration = self._get_recording_duration()
+                        with self.lock:
+                            motion_detected = self.motion_detected
+                            
+                        if not motion_detected and recording_duration > self.post_record_time:
+                            logger.info(f"Auto-stopping recording for {self.camera_id} (no motion, duration: {recording_duration:.1f}s)")
                             break
                             
+                    # Stop recording (state management handled internally)
                     self._stop_recording()
                     self.stop_recording_event.clear()
                     
@@ -435,14 +521,20 @@ class CameraWorker:
             logger.error(f"Error in MAIN stream loop for {self.camera_id}: {e}")
             with self.lock:
                 self.error_message = f"MAIN stream error: {e}"
-
-
-                
+                self._set_recording_state(False)  # Ensure state is cleared
+                    
+    # 3. UPDATED _start_recording METHOD - Reset motion trigger state  
     def _start_recording(self):
-        """Start FFmpeg recording on MAIN stream."""
+        """Start FFmpeg recording - thread-safe with motion state reset."""
         try:
-            if self.recording:
+            # Thread-safe state change
+            if not self._set_recording_state(True):
+                logger.debug(f"Recording already active for {self.camera_id}")
                 return
+                
+            # Reset motion trigger state when recording starts
+            with self.lock:
+                self.motion_trigger_sent = False  # Allow new triggers after recording ends
                 
             # Get main stream URL
             main_url = self.camera_config.get('url')
@@ -467,29 +559,32 @@ class CameraWorker:
             )
             
             self.recorder.start_recording()
-            
-            with self.lock:
-                self.recording = True
-                
             logger.info(f"Started recording for {self.camera_id}: {output_file}")
             
         except Exception as e:
             logger.error(f"Failed to start recording for {self.camera_id}: {e}")
             with self.lock:
                 self.error_message = f"Recording start error: {e}"
-                
+                self._set_recording_state(False)  # Clear state on failure
+                self.motion_trigger_sent = False  # Reset trigger state on failure
+
+    # 4. UPDATED _stop_recording METHOD - Reset motion trigger state
     def _stop_recording(self):
-        """Stop FFmpeg recording."""
+        """Stop FFmpeg recording - thread-safe with motion state reset."""
         try:
-            if not self.recording:
+            # Thread-safe state change  
+            if not self._set_recording_state(False):
+                logger.debug(f"Recording already stopped for {self.camera_id}")
                 return
+                
+            # Reset motion trigger state when recording stops
+            with self.lock:
+                self.motion_trigger_sent = False  # Allow new motion triggers
+                self.motion_start_time = None  # Reset motion timer
                 
             if self.recorder:
                 self.recorder.stop_recording()
                 self.recorder = None
-                
-            with self.lock:
-                self.recording = False
                 
             logger.info(f"Stopped recording for {self.camera_id}")
             
@@ -497,13 +592,13 @@ class CameraWorker:
             logger.error(f"Failed to stop recording for {self.camera_id}: {e}")
             with self.lock:
                 self.error_message = f"Recording stop error: {e}"
+                self.motion_trigger_sent = False  # Reset trigger state on error
+            # State already set to False by _set_recording_state above
+
 
 
 # For testing/debugging - can run worker standalone
 if __name__ == "__main__":
-    #
-    # Usage: python -m core.config_validator
-    #
     import sys
     
     if len(sys.argv) < 2:
