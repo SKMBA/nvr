@@ -129,26 +129,34 @@ class CameraWorker:
                 
         logger.info(f"Camera worker {self.camera_id} stopped")
         
-    # camera_worker.py - Replace the _heartbeat_loop method
+    # camera_worker.py - Enhance heartbeat to include recorder status
 
     def _heartbeat_loop(self):
-        """Send periodic heartbeat messages to supervisor with detailed status."""
+        """Send periodic heartbeat messages with recorder health status."""
         logger.info(f"Starting heartbeat loop for {self.camera_id}")
         
         while self.running:
             try:
                 with self.lock:
-                    # Determine detailed stream state
+                    # Get recorder status if available
+                    recorder_status = None
+                    if self.recorder:
+                        recorder_status = self.recorder.get_recording_status()
+                    
+                    # Determine stream state with recorder health
                     if self.error_message:
                         stream_state = "error"
                     elif self.recording:
-                        stream_state = "recording"  
+                        if recorder_status and recorder_status.get('failed'):
+                            stream_state = "recording_failed"
+                        else:
+                            stream_state = "recording"
                     elif self.last_fps > 0:
                         stream_state = "capturing"
                     else:
                         stream_state = "idle"
                     
-                    # Create heartbeat with enhanced information
+                    # Enhanced heartbeat message
                     heartbeat = HeartbeatMessage(
                         worker_id=self.camera_id,
                         timestamp=datetime.now().isoformat(),
@@ -158,27 +166,22 @@ class CameraWorker:
                         error_message=self.error_message
                     )
                     
-                    # Send heartbeat
                     self.status_queue.put_nowait(asdict(heartbeat))
                     
-                    # Log heartbeat details for debugging
-                    if self.error_message:
-                        logger.warning(f"Heartbeat from {self.camera_id}: {stream_state} - {self.error_message}")
+                    # Enhanced logging
+                    if recorder_status:
+                        logger.debug(f"Heartbeat {self.camera_id}: {stream_state} (fps: {self.last_fps:.1f}, "
+                                f"ffmpeg_restarts: {recorder_status.get('restart_count', 0)}, "
+                                f"dropped: {recorder_status.get('dropped_frames', 0)})")
                     else:
-                        logger.debug(f"Heartbeat from {self.camera_id}: {stream_state} (fps: {self.last_fps:.1f})")
-                    
-                    # Clear transient error messages after sending
-                    if self.error_message and not self.error_message.startswith("Max connection failures"):
-                        # Keep critical errors, clear transient ones after sending
-                        pass
+                        logger.debug(f"Heartbeat {self.camera_id}: {stream_state} (fps: {self.last_fps:.1f})")
                         
             except queue.Full:
-                logger.warning(f"Status queue full for worker {self.camera_id}, dropping heartbeat")
+                logger.warning(f"Status queue full for worker {self.camera_id}")
             except Exception as e:
                 logger.error(f"Error sending heartbeat from worker {self.camera_id}: {e}")
                 
-            time.sleep(5.0)  # Heartbeat every 5 seconds   
-
+            time.sleep(5.0)
 
     def _command_loop(self):
         """Process commands from supervisor."""
@@ -395,8 +398,10 @@ class CameraWorker:
             
         logger.info(f"SUB stream loop stopped for {self.camera_id}")    
 
+    # camera_worker.py - Enhance _main_stream_loop to use recorder health status
+
     def _main_stream_loop(self):
-        """MAIN stream thread - handles high-quality recording."""
+        """MAIN stream thread - handles high-quality recording with health monitoring."""
         logger.info(f"Starting MAIN stream loop for {self.camera_id}")
         
         try:
@@ -409,8 +414,13 @@ class CameraWorker:
                     # Record until stop signal or timeout
                     start_time = time.time()
                     while (self.running and 
-                           self.recording and 
-                           not self.stop_recording_event.wait(timeout=1.0)):
+                        self.recording and 
+                        not self.stop_recording_event.wait(timeout=1.0)):
+                        
+                        # Check if FFmpeg recording is still healthy
+                        if self.recorder and not self.recorder.is_recording_healthy():
+                            logger.warning(f"FFmpeg recording failed for {self.camera_id}, stopping recording")
+                            break
                         
                         # Auto-stop recording after post_record_time if no motion
                         if (not self.motion_detected and 
@@ -425,6 +435,8 @@ class CameraWorker:
             logger.error(f"Error in MAIN stream loop for {self.camera_id}: {e}")
             with self.lock:
                 self.error_message = f"MAIN stream error: {e}"
+
+
                 
     def _start_recording(self):
         """Start FFmpeg recording on MAIN stream."""

@@ -1,4 +1,5 @@
-# core/ffmpeg_recorder.py - Complete file with application-level resilience
+# ffmpeg_recorder.py - Add process monitoring capabilities
+
 import subprocess
 import threading
 import collections
@@ -32,6 +33,7 @@ class FFmpegRecorder:
         self.stop_monitor_event = threading.Event()
         self.restart_count = 0
         self.max_restarts = 3
+        self.recording_failed = False  # Flag to indicate recording failure
         
         logger.info(f"[FFmpegRecorder] Initialized with frame_size={self.frame_size}")
 
@@ -39,7 +41,7 @@ class FFmpegRecorder:
         resized = cv2.resize(frame, self.frame_size)
         with self.lock:
             self.frame_queue.append(resized)
-            if self.recording:
+            if self.recording and not self.recording_failed:
                 try:
                     self.write_queue.put_nowait(resized)
                 except queue.Full:
@@ -53,13 +55,16 @@ class FFmpegRecorder:
                 
             logger.info(f"[Recorder] Starting recording @{self.fps} fps...")
             
+            # Reset state
+            self.recording_failed = False
+            self.restart_count = 0
+            
             # Create output directory
             os.makedirs(os.path.dirname(self.output_file), exist_ok=True)
             
             # Start FFmpeg process
-            success = self._start_ffmpeg_process()
-            if not success:
-                logger.error("[Recorder] Failed to start FFmpeg process")
+            if not self._start_ffmpeg_process():
+                logger.error("[Recorder] Failed to start initial FFmpeg process")
                 return
             
             # Start writer thread
@@ -69,70 +74,177 @@ class FFmpegRecorder:
             
             # Start process monitoring
             self.stop_monitor_event.clear()
-            self.monitor_thread = threading.Thread(target=self._monitor_ffmpeg, daemon=True)
+            self.monitor_thread = threading.Thread(target=self._monitor_ffmpeg_process, daemon=True)
             self.monitor_thread.start()
             
             self.recording = True
-            self.restart_count = 0
-            
-            logger.info(f"[Recorder] Recording started successfully (PID: {self.process.pid})")
+            logger.info(f"[Recorder] Recording started with process monitoring (PID: {self.process.pid})")
 
     def _start_ffmpeg_process(self):
-        """Start the FFmpeg process."""
+        """Start FFmpeg process with error handling."""
         try:
-            # Simple, reliable FFmpeg command for Windows
+            # Simple, reliable command for Windows
             cmd = [
                 "ffmpeg",
-                "-y",  # Overwrite output
-                "-rtsp_transport", "tcp",  # Use TCP for RTSP
+                "-y",
+                "-rtsp_transport", "tcp",
                 "-i", self.url,
-                "-an",  # No audio
-                "-c:v", "libx264",
-                "-preset", "ultrafast", 
+                "-an",
+                "-c:v", "libx264", 
+                "-preset", "ultrafast",
                 "-pix_fmt", "yuv420p",
                 self.output_file,
             ]
             
-            logger.debug(f"[FFmpeg] Starting: {' '.join(cmd)}")
+            logger.debug(f"[FFmpeg] Command: {' '.join(cmd)}")
             
             self.process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=open(FFMPEG_LOG_FILE, "a"),
                 stderr=subprocess.STDOUT,
-                bufsize=0  # Unbuffered
+                bufsize=0
             )
             
-            # Add pre-record frames
+            # Add pre-record frames to queue
             for frame in self.frame_queue:
                 try:
                     self.write_queue.put_nowait(frame)
                 except queue.Full:
                     logger.warning("[FFmpegRecorder] Write queue full during prebuffer")
             
+            logger.info(f"[FFmpeg] Process started successfully (PID: {self.process.pid})")
             return True
             
         except Exception as e:
             logger.error(f"[FFmpeg] Failed to start process: {e}")
             return False
 
+    def _monitor_ffmpeg_process(self):
+        """Monitor FFmpeg process health and handle failures."""
+        logger.info(f"[FFmpeg Monitor] Starting process monitoring for PID: {self.process.pid}")
+        
+        while not self.stop_monitor_event.wait(2.0):  # Check every 2 seconds
+            try:
+                if not self.process:
+                    logger.warning("[FFmpeg Monitor] No process to monitor")
+                    break
+                
+                # Check if process is still running
+                exit_code = self.process.poll()
+                
+                if exit_code is not None:
+                    # Process has exited
+                    if exit_code == 0:
+                        logger.info(f"[FFmpeg Monitor] Process completed normally (exit code: {exit_code})")
+                        break  # Normal completion
+                    else:
+                        # Process failed
+                        logger.warning(f"[FFmpeg Monitor] Process failed (exit code: {exit_code}, restart: {self.restart_count}/{self.max_restarts})")
+                        
+                        # Attempt restart if under limit
+                        if self.restart_count < self.max_restarts and not self.stop_monitor_event.is_set():
+                            if self._restart_ffmpeg_process():
+                                self.restart_count += 1
+                                logger.info(f"[FFmpeg Monitor] Restart successful (attempt {self.restart_count})")
+                                continue  # Continue monitoring new process
+                            else:
+                                logger.error("[FFmpeg Monitor] Restart failed")
+                                break
+                        else:
+                            logger.error(f"[FFmpeg Monitor] Max restarts ({self.max_restarts}) reached or stopping")
+                            break
+                            
+            except Exception as e:
+                logger.error(f"[FFmpeg Monitor] Monitoring error: {e}")
+                time.sleep(5.0)  # Back off on errors
+        
+        # Recording has failed or ended
+        with self.lock:
+            if self.recording:
+                logger.warning("[FFmpeg Monitor] Marking recording as failed due to process exit")
+                self.recording_failed = True
+                
+        logger.info("[FFmpeg Monitor] Process monitoring stopped")
+
+    def _restart_ffmpeg_process(self):
+        """Restart FFmpeg process after failure."""
+        try:
+            logger.info("[FFmpeg Restart] Attempting to restart FFmpeg process...")
+            
+            # Clean up old process
+            if self.process:
+                try:
+                    self.process.kill()
+                    self.process.wait(timeout=3.0)
+                except Exception as e:
+                    logger.warning(f"[FFmpeg Restart] Error cleaning up old process: {e}")
+            
+            # Create new output filename to avoid file conflicts
+            base_name = os.path.splitext(self.output_file)[0]
+            extension = os.path.splitext(self.output_file)[1]
+            timestamp = datetime.now().strftime("%H%M%S")
+            new_output = f"{base_name}_part{self.restart_count + 1}_{timestamp}{extension}"
+            
+            # Update output file
+            old_output = self.output_file
+            self.output_file = new_output
+            
+            # Start new FFmpeg process
+            if self._start_ffmpeg_process():
+                logger.info(f"[FFmpeg Restart] Process restarted successfully: {new_output}")
+                return True
+            else:
+                logger.error("[FFmpeg Restart] Failed to start new process")
+                self.output_file = old_output  # Restore original name
+                return False
+                
+        except Exception as e:
+            logger.error(f"[FFmpeg Restart] Restart error: {e}")
+            return False
+
+    def is_recording_healthy(self):
+        """Check if recording is healthy (process alive and no failures)."""
+        with self.lock:
+            if not self.recording:
+                return False
+            if self.recording_failed:
+                return False
+            if not self.process:
+                return False
+            return self.process.poll() is None  # Process still running
+
+    def get_recording_status(self):
+        """Get detailed recording status for monitoring."""
+        with self.lock:
+            return {
+                'recording': self.recording,
+                'failed': self.recording_failed,
+                'restart_count': self.restart_count,
+                'dropped_frames': self.dropped_frames,
+                'process_alive': self.process.poll() is None if self.process else False,
+                'process_pid': self.process.pid if self.process else None
+            }
+
+    # Keep existing _writer_loop and stop_recording methods unchanged
     def _writer_loop(self):
         """Writer thread - sends frames to FFmpeg."""
-        logger.info("[Writer] Writer thread started")
-        
         while not self.stop_writer_event.is_set():
             try:
                 frame = self.write_queue.get(timeout=0.1)
                 
-                if self.process and self.process.stdin:
+                if self.process and self.process.stdin and not self.recording_failed:
                     try:
                         self.process.stdin.write(frame.tobytes())
-                        self.process.stdin.flush()
                     except BrokenPipeError:
                         logger.warning("[Writer] Broken pipe - FFmpeg process ended")
+                        with self.lock:
+                            self.recording_failed = True
                         break
                     except Exception as e:
                         logger.error(f"[Writer] Error writing frame: {e}")
+                        with self.lock:
+                            self.recording_failed = True
                         break
                         
             except queue.Empty:
@@ -140,94 +252,9 @@ class FFmpegRecorder:
             except Exception as e:
                 logger.error(f"[Writer] Writer loop error: {e}")
                 break
-                
-        logger.info("[Writer] Writer thread stopped")
-
-    def _monitor_ffmpeg(self):
-        """Monitor FFmpeg process and restart if needed."""
-        logger.info("[Monitor] FFmpeg process monitoring started")
-        
-        while not self.stop_monitor_event.wait(2.0):  # Check every 2 seconds
-            try:
-                if not self.process:
-                    logger.warning("[Monitor] No FFmpeg process to monitor")
-                    break
-                
-                # Check process status
-                exit_code = self.process.poll()
-                
-                if exit_code is not None:
-                    # Process has exited
-                    if exit_code == 0:
-                        logger.info(f"[Monitor] FFmpeg process exited normally (code: {exit_code})")
-                        break  # Normal exit, don't restart
-                    else:
-                        logger.warning(f"[Monitor] FFmpeg process failed (exit code: {exit_code})")
-                        
-                        # Attempt restart if under limit
-                        if self.restart_count < self.max_restarts:
-                            logger.info(f"[Monitor] Attempting restart ({self.restart_count + 1}/{self.max_restarts})")
-                            
-                            if self._restart_ffmpeg():
-                                self.restart_count += 1
-                                continue  # Continue monitoring new process
-                            else:
-                                logger.error("[Monitor] Restart failed")
-                                break
-                        else:
-                            logger.error(f"[Monitor] Max restarts ({self.max_restarts}) reached, giving up")
-                            break
-                            
-            except Exception as e:
-                logger.error(f"[Monitor] Monitor error: {e}")
-                time.sleep(5.0)  # Back off on errors
-                
-        # Recording failed/ended
-        with self.lock:
-            if self.recording:
-                logger.warning("[Monitor] Marking recording as stopped due to monitoring exit")
-                self.recording = False
-                
-        logger.info("[Monitor] FFmpeg process monitoring stopped")
-
-    def _restart_ffmpeg(self):
-        """Restart the FFmpeg process."""
-        try:
-            logger.info("[Restart] Restarting FFmpeg process...")
-            
-            # Kill old process
-            if self.process:
-                try:
-                    self.process.kill()
-                    self.process.wait(timeout=3.0)
-                except:
-                    pass
-                    
-            # Create new output file to avoid corruption
-            base_name = os.path.splitext(self.output_file)[0]
-            extension = os.path.splitext(self.output_file)[1] 
-            timestamp = datetime.now().strftime("%H%M%S")
-            new_output = f"{base_name}_restart_{timestamp}{extension}"
-            
-            # Update output file
-            old_output = self.output_file
-            self.output_file = new_output
-            
-            # Start new process
-            if self._start_ffmpeg_process():
-                logger.info(f"[Restart] FFmpeg restarted successfully: {new_output}")
-                return True
-            else:
-                logger.error("[Restart] Failed to restart FFmpeg")
-                self.output_file = old_output  # Restore original name
-                return False
-                
-        except Exception as e:
-            logger.error(f"[Restart] Restart error: {e}")
-            return False
 
     def stop_recording(self):
-        """Stop FFmpeg recording with graceful shutdown."""
+        """Stop recording with monitoring cleanup."""
         logger.info("[Recorder] Stopping recording...")
         
         with self.lock:
@@ -235,7 +262,7 @@ class FFmpegRecorder:
                 return
             self.recording = False
             
-        # Stop monitoring
+        # Stop monitoring first
         if self.monitor_thread:
             self.stop_monitor_event.set()
             self.monitor_thread.join(timeout=3.0)
@@ -247,61 +274,42 @@ class FFmpegRecorder:
             self.writer_thread.join(timeout=2.0)
             self.writer_thread = None
             
-        # Graceful FFmpeg shutdown
+        # Graceful FFmpeg shutdown (keep existing logic)
         try:
             if self.process and self.process.poll() is None:
-                logger.info("[Recorder] Sending 'q' command to FFmpeg for graceful shutdown...")
+                logger.info("[Recorder] Sending 'q' command for graceful shutdown...")
                 
                 try:
-                    # Send quit command
                     self.process.stdin.write(b'q\n')
                     self.process.stdin.flush()
-                    
-                    # Wait for graceful shutdown
                     exit_code = self.process.wait(timeout=10)
                     logger.info(f"[Recorder] FFmpeg finished gracefully (exit code: {exit_code})")
                     
                 except subprocess.TimeoutExpired:
                     logger.warning("[Recorder] Graceful shutdown timeout, terminating...")
                     self.process.terminate()
-                    
-                    try:
-                        exit_code = self.process.wait(timeout=5)
-                        logger.info(f"[Recorder] FFmpeg terminated (exit code: {exit_code})")
-                    except subprocess.TimeoutExpired:
-                        logger.warning("[Recorder] Termination timeout, force killing...")
-                        self.process.kill()
-                        self.process.wait()
-                        
-                except (BrokenPipeError, OSError):
-                    # FFmpeg already closed
-                    logger.info("[Recorder] FFmpeg already closed")
                     self.process.wait(timeout=5)
                     
                 except Exception as e:
-                    logger.error(f"[Recorder] Error during graceful shutdown: {e}")
-                    try:
-                        self.process.terminate()
-                        self.process.wait(timeout=5)
-                    except:
-                        self.process.kill()
-                        self.process.wait()
-                        
+                    logger.warning(f"[Recorder] Graceful shutdown error: {e}")
+                    self.process.terminate()
+                    self.process.wait(timeout=5)
+                    
                 finally:
-                    # Close stdin
                     try:
-                        if self.process and self.process.stdin:
+                        if self.process.stdin:
                             self.process.stdin.close()
                     except:
                         pass
                         
         except Exception as e:
-            logger.error(f"[Recorder] Error stopping FFmpeg: {e}")
+            logger.error(f"[Recorder] Error stopping: {e}")
             
         finally:
             self.process = None
-            logger.info(f"[Recorder] Recording stopped. Total dropped frames: {self.dropped_frames}")
+            logger.info(f"[Recorder] Recording stopped. Restarts: {self.restart_count}, Dropped frames: {self.dropped_frames}")
 
+    # Keep existing utility methods
     def get_dropped_frames(self):
         return self.dropped_frames
 
