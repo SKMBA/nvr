@@ -129,35 +129,57 @@ class CameraWorker:
                 
         logger.info(f"Camera worker {self.camera_id} stopped")
         
+    # camera_worker.py - Replace the _heartbeat_loop method
+
     def _heartbeat_loop(self):
-        """Send periodic heartbeat messages to supervisor."""
+        """Send periodic heartbeat messages to supervisor with detailed status."""
         logger.info(f"Starting heartbeat loop for {self.camera_id}")
         
         while self.running:
             try:
                 with self.lock:
-                    stream_state = "error" if self.error_message else ("recording" if self.recording else "capturing")
+                    # Determine detailed stream state
+                    if self.error_message:
+                        stream_state = "error"
+                    elif self.recording:
+                        stream_state = "recording"  
+                    elif self.last_fps > 0:
+                        stream_state = "capturing"
+                    else:
+                        stream_state = "idle"
                     
-                heartbeat = HeartbeatMessage(
-                    worker_id=self.camera_id,
-                    timestamp=datetime.now().isoformat(),
-                    stream_state=stream_state,
-                    fps=self.last_fps,
-                    recording=self.recording,
-                    error_message=self.error_message
-                )
-                
-                self.status_queue.put_nowait(asdict(heartbeat))
-                
-                # Clear error message after sending
-                if self.error_message:
-                    self.error_message = None
+                    # Create heartbeat with enhanced information
+                    heartbeat = HeartbeatMessage(
+                        worker_id=self.camera_id,
+                        timestamp=datetime.now().isoformat(),
+                        stream_state=stream_state,
+                        fps=self.last_fps,
+                        recording=self.recording,
+                        error_message=self.error_message
+                    )
                     
+                    # Send heartbeat
+                    self.status_queue.put_nowait(asdict(heartbeat))
+                    
+                    # Log heartbeat details for debugging
+                    if self.error_message:
+                        logger.warning(f"Heartbeat from {self.camera_id}: {stream_state} - {self.error_message}")
+                    else:
+                        logger.debug(f"Heartbeat from {self.camera_id}: {stream_state} (fps: {self.last_fps:.1f})")
+                    
+                    # Clear transient error messages after sending
+                    if self.error_message and not self.error_message.startswith("Max connection failures"):
+                        # Keep critical errors, clear transient ones after sending
+                        pass
+                        
+            except queue.Full:
+                logger.warning(f"Status queue full for worker {self.camera_id}, dropping heartbeat")
             except Exception as e:
                 logger.error(f"Error sending heartbeat from worker {self.camera_id}: {e}")
                 
-            time.sleep(5.0)  # Heartbeat every 5 seconds
-            
+            time.sleep(5.0)  # Heartbeat every 5 seconds   
+
+
     def _command_loop(self):
         """Process commands from supervisor."""
         logger.info(f"Starting command loop for {self.camera_id}")
@@ -194,9 +216,10 @@ class CameraWorker:
                 
         except Exception as e:
             logger.error(f"Error handling command {cmd_data}: {e}")
-            
+
+    # camera_worker.py - Replace the _sub_stream_loop method
     def _sub_stream_loop(self):
-        """SUB stream thread - handles preview and motion detection."""
+        """SUB stream thread - handles preview and motion detection with recovery."""
         logger.info(f"Starting SUB stream loop for {self.camera_id} (preview and motion detection)")
         
         cap = None
@@ -204,33 +227,116 @@ class CameraWorker:
         frame_count = 0
         last_fps_time = time.time()
         
-        try:
-            # Get camera URL - prefer sub_url, fallback to main
-            # url = CameraHelper.get_camera_url(self.camera_id, timeout=2.0)
-            logger.debug(f"Retrieve SUB stream for {self.camera_id}")
-            url = CameraHelper.get_camera_sub_url(self.camera_id, timeout=2.0)
-            if url == None:
-                logger.warning(f"SUB stream not available, fallback to MAIN stream for {self.camera_id}")
-                logger.debug(f"Retrieve MAIN stream for {self.camera_id}")
-                url = CameraHelper.get_camera_main_url(self.camera_id, timeout=2.0)
+        # Connection tracking
+        connection_failures = 0
+        max_connection_failures = 5
+        last_connection_attempt = 0
+        reconnection_delay = 5.0  # Start with 5 second delay
+        max_reconnection_delay = 60.0
+        
+        while self.running:
+            try:
+                # Check if we need to establish/re-establish connection
+                if cap is None or not cap.isOpened():
+                    current_time = time.time()
+                    
+                    # Rate limit reconnection attempts
+                    if current_time - last_connection_attempt < reconnection_delay:
+                        time.sleep(0.1)
+                        continue
+                        
+                    last_connection_attempt = current_time
+                    
+                    # Release old capture if exists
+                    if cap:
+                        cap.release()
+                        cap = None
+                    
+                    # Get camera URL with fallback
+                    logger.info(f"Attempting to connect SUB stream for {self.camera_id}")
+                    url = CameraHelper.get_camera_sub_url(self.camera_id, timeout=2.0)
+                    if not url:
+                        logger.warning(f"SUB stream not available, fallback to MAIN stream for {self.camera_id}")
+                        url = CameraHelper.get_camera_main_url(self.camera_id, timeout=2.0)
 
-            if not url:
-                logger.critical (f"Both MAIN and SUB streamS unreachable for Camera {camera_id }")
-                raise ValueError(f"No valid camera URL found for {self.camera_id}")
+                    if not url:
+                        connection_failures += 1
+                        logger.error(f"Both MAIN and SUB streams unreachable for Camera {self.camera_id} (failures: {connection_failures}/{max_connection_failures})")
+                        
+                        # Report error to supervisor via heartbeat
+                        with self.lock:
+                            self.error_message = f"No valid camera URL (failures: {connection_failures})"
+                        
+                        if connection_failures >= max_connection_failures:
+                            logger.critical(f"Max connection failures reached for {self.camera_id}, stopping SUB stream")
+                            with self.lock:
+                                self.error_message = "Max connection failures reached"
+                            break
+                        
+                        # Exponential backoff
+                        reconnection_delay = min(reconnection_delay * 1.5, max_reconnection_delay)
+                        time.sleep(reconnection_delay)
+                        continue
+                    
+                    # Attempt connection
+                    try:
+                        cap = cv2.VideoCapture(url)
+                        if not cap.isOpened():
+                            raise ValueError(f"Cannot open camera stream: {url}")
+                        
+                        # Test read a frame
+                        ret, test_frame = cap.read()
+                        if not ret:
+                            raise ValueError(f"Cannot read from camera stream: {url}")
+                        
+                        # Connection successful
+                        logger.info(f"SUB stream connected to {url} for {self.camera_id}")
+                        connection_failures = 0
+                        reconnection_delay = 5.0  # Reset delay
+                        
+                        # Clear error state
+                        with self.lock:
+                            self.error_message = None
+                        
+                        # Reset frame tracking
+                        prev_frame = None
+                        frame_count = 0
+                        last_fps_time = time.time()
+                        
+                    except Exception as e:
+                        connection_failures += 1
+                        logger.warning(f"Failed to connect to {url} for {self.camera_id}: {e} (failures: {connection_failures}/{max_connection_failures})")
+                        
+                        if cap:
+                            cap.release()
+                            cap = None
+                        
+                        # Report connection error
+                        with self.lock:
+                            self.error_message = f"Connection failed: {str(e)[:50]}..."
+                        
+                        # Exponential backoff
+                        reconnection_delay = min(reconnection_delay * 1.5, max_reconnection_delay)
+                        time.sleep(reconnection_delay)
+                        continue
                 
-            cap = cv2.VideoCapture(url)
-            if not cap.isOpened():
-                raise ValueError(f"Cannot open camera stream: {url}")
-                
-            logger.info(f"SUB stream connected to {url}")
-            
-            while self.running:
+                # Read frame from established connection
                 ret, frame = cap.read()
                 if not ret:
                     logger.warning(f"Failed to read frame from SUB stream {self.camera_id}")
-                    time.sleep(0.1)
-                    continue
                     
+                    # Mark connection as failed
+                    if cap:
+                        cap.release()
+                        cap = None
+                    
+                    with self.lock:
+                        self.error_message = "Frame read failed"
+                        
+                    time.sleep(1.0)  # Brief pause before reconnection
+                    continue
+                
+                # Frame processing (existing logic)
                 frame_count += 1
                 current_time = time.time()
                 
@@ -240,7 +346,7 @@ class CameraWorker:
                         self.last_fps = frame_count / (current_time - last_fps_time)
                     frame_count = 0
                     last_fps_time = current_time
-                    
+                
                 # Motion detection
                 gray = preprocess_frame(frame)
                 if prev_frame is not None:
@@ -270,14 +376,25 @@ class CameraWorker:
                 # Small delay to prevent CPU overload
                 time.sleep(0.033)  # ~30 FPS max
                 
-        except Exception as e:
-            logger.error(f"Error in SUB stream loop for {self.camera_id}: {e}")
-            with self.lock:
-                self.error_message = f"SUB stream error: {e}"
-        finally:
-            if cap:
-                cap.release()
+            except Exception as e:
+                logger.error(f"Unexpected error in SUB stream loop for {self.camera_id}: {e}")
                 
+                # Release resources on error
+                if cap:
+                    cap.release()
+                    cap = None
+                    
+                with self.lock:
+                    self.error_message = f"Unexpected error: {str(e)[:50]}..."
+                    
+                time.sleep(5.0)  # Back off on unexpected errors
+        
+        # Cleanup
+        if cap:
+            cap.release()
+            
+        logger.info(f"SUB stream loop stopped for {self.camera_id}")    
+
     def _main_stream_loop(self):
         """MAIN stream thread - handles high-quality recording."""
         logger.info(f"Starting MAIN stream loop for {self.camera_id}")

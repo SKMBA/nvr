@@ -83,9 +83,16 @@ class WorkerManager:
             validated_cameras = ConfigValidator.validate_all_cameras(cameras)
             ConfigValidator.print_validation_summary(validated_cameras)
             
-            # Use validated camera IDs
-            camera_ids = list(validated_cameras.keys())
-            logger.info(f"Found {len(camera_ids)} valid cameras: {camera_ids}")
+            # Filter out enabled cameras
+            enabled_cameras = {
+                    cam_id: cfg
+                    for cam_id, cfg in validated_cameras.items()
+                    if cfg.get("enabled", True)
+                }
+            
+            # Use validated enabled camera IDs
+            camera_ids = list(enabled_cameras.keys())
+            logger.info(f"Found {len(camera_ids)} valid enabled cameras: {camera_ids}")
             
         except ConfigValidationError as e:
             logger.error(f"Camera configuration validation failed: {e}")
@@ -219,9 +226,11 @@ class WorkerManager:
                 time.sleep(5.0)
                 
         logger.info("Worker monitor loop stopped")
-        
+
+    # supervisor.py - Replace the _process_status_messages method
+
     def _process_status_messages(self):
-        """Process heartbeat and status messages from workers."""
+        """Process heartbeat and status messages from workers with enhanced error handling."""
         for worker_info in self.workers.values():
             try:
                 while not worker_info.status_queue.empty():
@@ -231,25 +240,39 @@ class WorkerManager:
                     if isinstance(msg_data, dict) and msg_data.get('timestamp'):
                         worker_info.last_heartbeat = datetime.now()
                         
-                        # Log worker status
+                        # Extract detailed status
                         state = msg_data.get('stream_state', 'unknown')
                         fps = msg_data.get('fps', 0.0)
                         recording = msg_data.get('recording', False)
+                        error_msg = msg_data.get('error_message')
                         
-                        if worker_info.state == WorkerState.UNHEALTHY:
-                            logger.info(f"Worker {worker_info.camera_id} recovered (state: {state}, fps: {fps:.1f})")
-                            worker_info.state = WorkerState.RUNNING
-                            worker_info.restart_count = 0  # Reset restart count on recovery
-                            
-                        # Log errors
-                        if msg_data.get('error_message'):
-                            logger.warning(f"Worker {worker_info.camera_id} reported error: {msg_data['error_message']}")
-                            
+                        # Assess worker health based on stream state and errors
+                        if error_msg:
+                            if "Max connection failures" in error_msg or "No valid camera URL" in error_msg:
+                                # Critical errors - mark as unhealthy
+                                if worker_info.state == WorkerState.RUNNING:
+                                    logger.error(f"Worker {worker_info.camera_id} critical error: {error_msg}")
+                                    worker_info.state = WorkerState.UNHEALTHY
+                            else:
+                                # Transient errors - log but don't change state immediately
+                                logger.warning(f"Worker {worker_info.camera_id} transient error: {error_msg}")
+                        else:
+                            # No errors - check if recovering from unhealthy state
+                            if worker_info.state == WorkerState.UNHEALTHY and fps > 0:
+                                logger.info(f"Worker {worker_info.camera_id} recovered (state: {state}, fps: {fps:.1f})")
+                                worker_info.state = WorkerState.RUNNING
+                                worker_info.restart_count = 0  # Reset restart count on recovery
+                            elif worker_info.state == WorkerState.RUNNING:
+                                # Normal operation - just log at debug level
+                                logger.debug(f"Worker {worker_info.camera_id} healthy: {state} (fps: {fps:.1f}, recording: {recording})")
+                        
             except Exception as e:
                 logger.error(f"Error processing status from worker {worker_info.camera_id}: {e}")
-                
+
+    # supervisor.py - Also replace the _check_worker_health method
+
     def _check_worker_health(self, worker_info: WorkerInfo, current_time: datetime):
-        """Check if a worker is healthy and restart if needed."""
+        """Check if a worker is healthy and restart if needed with enhanced criteria."""
         
         # Check if process is alive
         if worker_info.process and not worker_info.process.is_alive():
@@ -269,12 +292,22 @@ class WorkerManager:
                 
             # If unhealthy for too long, restart
             elif (worker_info.state == WorkerState.UNHEALTHY and 
-                  current_time - worker_info.last_heartbeat > timedelta(seconds=self.heartbeat_timeout * 2)):
+                current_time - worker_info.last_heartbeat > timedelta(seconds=self.heartbeat_timeout * 2)):
                 logger.error(f"Worker {worker_info.camera_id} unresponsive, restarting...")
                 self._stop_worker(worker_info)
                 worker_info.state = WorkerState.CRASHED
                 self._schedule_restart(worker_info)
-                
+        
+        # Check for persistent unhealthy state (new check)
+        elif (worker_info.state == WorkerState.UNHEALTHY and 
+            worker_info.last_heartbeat and
+            current_time - worker_info.last_heartbeat > timedelta(seconds=self.heartbeat_timeout * 3)):
+            # Worker is sending heartbeats but reporting persistent errors
+            logger.error(f"Worker {worker_info.camera_id} persistently unhealthy, restarting...")
+            self._stop_worker(worker_info)
+            worker_info.state = WorkerState.CRASHED
+            self._schedule_restart(worker_info)
+            
         # Handle scheduled restarts
         if (worker_info.state == WorkerState.CRASHED and 
             worker_info.next_restart and 
@@ -282,7 +315,8 @@ class WorkerManager:
             
             logger.info(f"Restarting worker {worker_info.camera_id} (attempt #{worker_info.restart_count})")
             self._start_worker_process(worker_info)
-            
+
+
     def get_status(self) -> Dict:
         """Get status of all workers for health endpoint."""
         status = {
