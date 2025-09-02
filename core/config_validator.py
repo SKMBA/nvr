@@ -2,7 +2,8 @@
 from typing import Dict, Any, List, Optional, Tuple
 
 
-from core.logger_config import logger
+from core.logger_config import get_logger
+logger = get_logger()
 
 class ConfigValidationError(Exception):
     """Raised when configuration validation fails."""

@@ -6,10 +6,11 @@ import signal
 import multiprocessing as mp
 from pathlib import Path
 
-from core.logger_config import logger
 from supervisor import WorkerManager
 from health_api import HealthAPI
 
+from core.logger_config import get_logger
+logger = get_logger("APP.MAIN")  
 
 def get_runtime_path():
     """Get the runtime path for the application."""

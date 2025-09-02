@@ -1,12 +1,11 @@
-# core/logger_config.py
-
+# core\logger_config.py
 import logging
 import os
 import json
 import re
 import threading
 from pathlib import Path
-from typing import Union, Any
+from typing import Union, Any, Optional
 from datetime import datetime, timedelta
 from core.app_config import AppConfig
 
@@ -17,8 +16,8 @@ class DailyRotatingFileHandler(logging.FileHandler):
     and automatic retention management.
     """
     
-    def __init__(self, log_folder, base_filename, max_size_bytes=0, 
-                 auto_delete_old_logs=False, keep_last_n_days=7, mode='a', 
+    def __init__(self, log_folder, base_filename, max_size_bytes=0,
+                 auto_delete_old_logs=False, keep_last_n_days=7, mode='a',
                  encoding=None, delay=False):
         """
         Initialize the rotating file handler.
@@ -54,7 +53,7 @@ class DailyRotatingFileHandler(logging.FileHandler):
         
         # Initialize parent FileHandler
         super().__init__(str(self.current_file_path), mode, encoding, delay)
-    
+
     def _determine_current_file(self):
         """Determine the current log file based on date and existing files."""
         today = datetime.now().date()
@@ -62,6 +61,7 @@ class DailyRotatingFileHandler(logging.FileHandler):
         
         # Find existing files for today to determine sequence
         date_str = today.strftime('%Y-%m-%d')
+        
         pattern = f"{self.base_filename}-{date_str}*.log"
         existing_files = list(self.log_folder.glob(pattern))
         
@@ -86,7 +86,7 @@ class DailyRotatingFileHandler(logging.FileHandler):
                 filename = latest_file.name
         
         self.current_file_path = self.log_folder / filename
-    
+
     def _get_latest_file_for_date(self, date_str):
         """Get the latest (highest sequence) log file for a given date."""
         pattern = f"{self.base_filename}-{date_str}*.log"
@@ -100,12 +100,12 @@ class DailyRotatingFileHandler(logging.FileHandler):
             return int(match.group(1)) if match and match.group(1) else 0
         
         return max(files, key=extract_seq)
-    
+
     def _extract_sequence_from_file(self, file_path):
         """Extract sequence number from filename."""
         match = re.search(r'\.(\d+)\.log$', file_path.name)
         return int(match.group(1)) if match else 0
-    
+
     def _get_next_sequence(self, date_str):
         """Get the next sequence number for the given date."""
         pattern = f"{self.base_filename}-{date_str}*.log"
@@ -122,7 +122,7 @@ class DailyRotatingFileHandler(logging.FileHandler):
                 sequences.append(seq)
         
         return max(sequences) + 1 if sequences else 1
-    
+
     def _should_rotate(self):
         """Check if log rotation is needed (date change or size limit)."""
         today = datetime.now().date()
@@ -141,7 +141,7 @@ class DailyRotatingFileHandler(logging.FileHandler):
                 pass
         
         return False
-    
+
     def _rotate_if_needed(self):
         """Rotate log file if needed and update current file path."""
         if not self._should_rotate():
@@ -166,7 +166,7 @@ class DailyRotatingFileHandler(logging.FileHandler):
             # Clean up old logs if configured
             if self.auto_delete_old_logs:
                 self._cleanup_old_logs()
-    
+
     def _cleanup_old_logs(self):
         """Remove old log files based on retention policy."""
         if not self.auto_delete_old_logs or self.keep_last_n_days <= 0:
@@ -193,7 +193,7 @@ class DailyRotatingFileHandler(logging.FileHandler):
         except Exception as e:
             # Don't let cleanup errors break logging
             print(f"Warning: Log cleanup failed: {e}")
-    
+
     def emit(self, record):
         """Emit a record, rotating if necessary."""
         try:
@@ -298,72 +298,51 @@ def _get_rotation_config(log_config):
     }
 
 
-def setup_logger(config: Union[dict, Any]) -> logging.Logger:
-    """
-    Setup logger based on configuration object or dictionary.
-    Now supports daily log rotation with size-based splitting and retention management.
-    
-    Args:
-        config: Configuration object (from AppConfig) or dictionary
-        
-    Returns:
-        Configured logger instance
-    """
-    # Handle both object notation and dictionary access
+# Global configuration and shared handlers
+_shared_handlers = []
+_config_loaded = False
+_config_lock = threading.Lock()
+
+
+def _setup_shared_handlers(config: Union[dict, Any]) -> list:
+    """Setup shared handlers that all loggers can use."""
     if hasattr(config, 'logging'):
         log_config = config.logging
     else:
         log_config = config.get("logging", {})
     
-    # Extract configuration values with defaults (unchanged from original)
-    logger_name = getattr(log_config, 'name', None) or log_config.get('name', 'nvr_logger')
-    level_str = getattr(log_config, 'level', None) or log_config.get('level', 'DEBUG')
+    handlers = []
+    
+    # Extract configuration
     console_enabled = getattr(log_config, 'console_enabled', None)
     if console_enabled is None:
         console_enabled = log_config.get('console_enabled', True)
+    
     file_enabled = getattr(log_config, 'file_enabled', None)
     if file_enabled is None:
         file_enabled = log_config.get('file_enabled', False)
     
-    log_format = getattr(log_config, 'format', None) or log_config.get('format', '[%(asctime)s] %(levelname)s - %(message)s')
+    log_format = getattr(log_config, 'format', None) or log_config.get('format', '[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s')
     date_format = getattr(log_config, 'datefmt', None) or log_config.get('datefmt', '%Y-%m-%d %H:%M:%S')
     
-    # Get logger instance
-    logger = logging.getLogger(logger_name)
-    
-    # Set logging level
-    level = getattr(logging, level_str.upper(), logging.DEBUG)
-    logger.setLevel(level)
-    
-    # Clear existing handlers to avoid duplicates
-    if logger.hasHandlers():
-        logger.handlers.clear()
-    
-    # Create formatter
     formatter = logging.Formatter(log_format, datefmt=date_format)
     
-    # Setup console handler if enabled (unchanged from original)
+    # Console handler
     if console_enabled:
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
+        handlers.append(console_handler)
     
-    # Setup file handler if enabled (enhanced with rotation support)
+    # File handler
     if file_enabled:
         log_folder = getattr(log_config, 'folder', None) or log_config.get('folder', 'logs')
         log_file = getattr(log_config, 'file', None) or log_config.get('file', 'app.log')
         
-        # Create log directory if it doesn't exist
         Path(log_folder).mkdir(parents=True, exist_ok=True)
-        
-        # Extract rotation configuration
         rotation_settings = _get_rotation_config(log_config)
         
-        # Choose handler based on whether rotation is configured
         if rotation_settings['max_log_file_size_bytes'] > 0 or rotation_settings['auto_delete_old_logs']:
-            # Use rotating handler with enhanced features
-            base_filename = Path(log_file).stem  # Remove .log extension for rotation naming
-            
+            base_filename = Path(log_file).stem
             try:
                 file_handler = DailyRotatingFileHandler(
                     log_folder=log_folder,
@@ -373,50 +352,155 @@ def setup_logger(config: Union[dict, Any]) -> logging.Logger:
                     keep_last_n_days=rotation_settings['keep_last_n_days']
                 )
             except Exception as e:
-                # Fallback to standard FileHandler if rotation setup fails
-                logger.warning(f"Failed to setup log rotation, falling back to standard logging: {e}")
+                # Fallback to standard logging
                 log_path = Path(log_folder) / log_file
                 file_handler = logging.FileHandler(log_path)
         else:
-            # Use standard handler for backward compatibility (original behavior)
             log_path = Path(log_folder) / log_file
             file_handler = logging.FileHandler(log_path)
         
         file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+        handlers.append(file_handler)
     
-    return logger
+    return handlers
 
 
-# Initialize logger using AppConfig (unchanged from original)
-try:
-    app_config = AppConfig(str(Path("config\\app_config.json").resolve()))
-    config_obj = app_config.get_config()
-    logger = setup_logger(config_obj)
+def _load_shared_config():
+    """Load configuration and setup shared handlers once."""
+    global _shared_handlers, _config_loaded
     
-    # For backward compatibility - ensure 'nvr_logger' is available
-    if hasattr(config_obj.logging, 'name') and config_obj.logging.name != 'nvr_logger':
-        # If config uses different name, also setup nvr_logger for compatibility
-        nvr_logger = logging.getLogger('nvr_logger')
-        if not nvr_logger.hasHandlers():
-            # Copy handlers from main logger
-            for handler in logger.handlers:
-                nvr_logger.addHandler(handler)
-            nvr_logger.setLevel(logger.level)
-    
-except (FileNotFoundError, json.JSONDecodeError, Exception) as e:
-    # Fallback to basic configuration if config loading fails (unchanged from original)
-    logger = logging.getLogger("nvr_logger")
-    logger.setLevel(logging.DEBUG)
-    if not logger.hasHandlers():
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter(
-            "[%(asctime)s] %(levelname)s - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S"
-        )
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-        logger.warning(f"Failed to load config, using default logging: {e}")
+    with _config_lock:
+        if _config_loaded:
+            return
+        
+        try:
+            app_config = AppConfig(str(Path("config\\app_config.json").resolve()))
+            config_obj = app_config.get_config()
+            _shared_handlers = _setup_shared_handlers(config_obj)
+            _config_loaded = True
+        except (FileNotFoundError, json.JSONDecodeError, Exception) as e:
+            # Fallback to default console handler
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter(
+                "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S"
+            )
+            handler.setFormatter(formatter)
+            _shared_handlers = [handler]
+            _config_loaded = True
+            
+            # Log warning using a temporary logger
+            temp_logger = logging.getLogger("logger_config")
+            temp_logger.setLevel(logging.DEBUG)
+            temp_logger.addHandler(handler)
+            temp_logger.warning(f"Failed to load config, using default logging: {e}")
 
-# Export the configured logger for backward compatibility (unchanged)
-__all__ = ['logger', 'setup_logger']
+
+def get_logger(name: Optional[str] = None) -> logging.Logger:
+    """
+    Get a logger for the calling module.
+    
+    Args:
+        name: Logger name. If None, uses the calling module's __name__.
+              For backward compatibility, 'nvr_logger' is still supported.
+    
+    Returns:
+        Configured logger instance with shared handlers.
+    
+    Example:
+        # Automatic module-based naming (recommended)
+        logger = get_logger()  # Will use __name__ from calling module
+        
+        # Explicit naming (backward compatibility)
+        logger = get_logger('nvr_logger')
+        
+        # Custom naming
+        logger = get_logger('camera_worker.Tapo')
+    """
+    # Ensure shared configuration is loaded
+    _load_shared_config()
+    
+    # Determine logger name
+    if name is None:
+        # Auto-detect calling module name
+        import inspect
+        frame = inspect.currentframe()
+        try:
+            # Go up the call stack to find the calling module
+            caller_frame = frame.f_back
+            if caller_frame and '__name__' in caller_frame.f_globals:
+                name = caller_frame.f_globals['__name__']
+            else:
+                name = 'nvr_logger'  # Fallback
+        finally:
+            del frame  # Prevent reference cycles
+    
+    # Get or create logger
+    logger_instance = logging.getLogger(name)
+    
+    # Configure logger if not already configured
+    if not logger_instance.handlers:
+        logger_instance.setLevel(logging.DEBUG)
+        
+        # Add shared handlers
+        for handler in _shared_handlers:
+            logger_instance.addHandler(handler)
+        
+        # Prevent propagation to avoid duplicate messages
+        logger_instance.propagate = False
+    
+    return logger_instance
+
+
+def setup_logger(config: Union[dict, Any]) -> logging.Logger:
+    """
+    Legacy function for backward compatibility.
+    
+    Args:
+        config: Configuration object or dictionary
+    
+    Returns:
+        Logger instance (defaults to 'nvr_logger' for compatibility)
+    """
+    global _shared_handlers, _config_loaded
+    
+    with _config_lock:
+        _shared_handlers = _setup_shared_handlers(config)
+        _config_loaded = True
+    
+    return get_logger('nvr_logger')
+
+
+def get_module_logger() -> logging.Logger:
+    """
+    Convenience function to get a logger for the calling module.
+    Equivalent to get_logger() but more explicit.
+    
+    Returns:
+        Logger instance named after the calling module.
+    """
+    return get_logger()
+
+
+def reset_logging_config():
+    """Reset the logging configuration. Useful for tests."""
+    global _shared_handlers, _config_loaded
+    
+    with _config_lock:
+        # Clear all existing loggers
+        for logger_name in list(logging.Logger.manager.loggerDict.keys()):
+            logger_instance = logging.getLogger(logger_name)
+            logger_instance.handlers.clear()
+            logger_instance.setLevel(logging.NOTSET)
+        
+        _shared_handlers.clear()
+        _config_loaded = False
+
+
+# Initialize shared configuration on module import
+_load_shared_config()
+
+# Backward compatibility: create the default nvr_logger
+logger = get_logger('nvr_logger')
+
+__all__ = ['logger', 'get_logger', 'get_module_logger', 'setup_logger', 'reset_logging_config']
