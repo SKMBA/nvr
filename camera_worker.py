@@ -5,6 +5,7 @@ import signal
 import sys
 import cv2
 import os
+import numpy as np
 from typing import Optional, Dict, Any
 from dataclasses import asdict
 from datetime import datetime
@@ -180,72 +181,7 @@ class CameraWorker:
                 thread.join(timeout=2.0)
                 
         logger.info(f"Camera worker {self.camera_id} stopped")
-        
-    def _heartbeat_loop(self):
-        """Send periodic heartbeat with thread-safe state access."""
-        logger.info(f"Starting heartbeat loop for {self.camera_id}")
-        
-        while self.running:
-            try:
-                # Thread-safe state collection
-                with self.lock:
-                    current_recording = self._recording
-                    current_fps = self.last_fps
-                    current_error = self.error_message
-                    
-                # Get recorder status safely
-                recorder_status = None
-                if self.recorder:
-                    try:
-                        recorder_status = self.recorder.get_recording_status()
-                    except Exception as e:
-                        logger.warning(f"Error getting recorder status: {e}")
-                
-                # Determine stream state
-                if current_error:
-                    stream_state = "error"
-                elif current_recording:
-                    if recorder_status and recorder_status.get('failed'):
-                        stream_state = "recording_failed"
-                    else:
-                        stream_state = "recording"
-                elif current_fps > 0:
-                    stream_state = "capturing" 
-                else:
-                    stream_state = "idle"
-                
-                # Create and send heartbeat
-                heartbeat = HeartbeatMessage(
-                    worker_id=self.camera_id,
-                    timestamp=datetime.now().isoformat(),
-                    stream_state=stream_state,
-                    fps=current_fps,
-                    recording=current_recording,
-                    error_message=current_error
-                )
-                
-                self.status_queue.put_nowait(asdict(heartbeat))
-                
-                # Debug logging with recording duration
-                if recorder_status:
-                    logger.debug(f"Heartbeat {self.camera_id}: {stream_state} (fps: {current_fps:.1f}, "
-                               f"duration: {self._get_recording_duration():.1f}s, "
-                               f"ffmpeg_restarts: {recorder_status.get('restart_count', 0)})")
-                else:
-                    logger.debug(f"Heartbeat {self.camera_id}: {stream_state} (fps: {current_fps:.1f})")
-                    
-                # Clear transient error messages after sending
-                if current_error and not current_error.startswith("Max connection failures"):
-                    with self.lock:
-                        if self.error_message == current_error:  # Only clear if unchanged
-                            self.error_message = None
-                    
-            except queue.Full:
-                logger.warning(f"Status queue full for worker {self.camera_id}")
-            except Exception as e:
-                logger.error(f"Error sending heartbeat from worker {self.camera_id}: {e}")
-                
-            time.sleep(5.0)  # Heartbeat every 5 seconds
+       
             
     def _command_loop(self):
         """Process commands from supervisor."""
@@ -263,9 +199,9 @@ class CameraWorker:
             except Exception as e:
                 logger.error(f"Error processing command in worker {self.camera_id}: {e}")
                 
-            
+    # 2. UPDATED _sub_stream_loop METHOD - Enhanced with frame validation and health monitoring
     def _sub_stream_loop(self):
-        """SUB stream thread - handles preview and motion detection with recovery."""
+        """SUB stream thread - enhanced with frame validation and silent failure detection."""
         logger.info(f"Starting SUB stream loop for {self.camera_id} (preview and motion detection)")
         
         cap = None
@@ -280,8 +216,35 @@ class CameraWorker:
         reconnection_delay = 5.0
         max_reconnection_delay = 60.0
         
+        # Frame health tracking
+        self.frame_validation_failures = 0
+        self.total_frames_processed = 0
+        consecutive_frame_failures = 0
+        max_consecutive_frame_failures = 10
+        last_health_check = time.time()
+        health_check_interval = 30.0  # Check stream health every 30 seconds
+        
+        # Frame quality tracking
+        last_valid_frame_time = time.time()
+        max_frame_gap = 5.0  # Maximum seconds without valid frame
+        
         while self.running:
             try:
+                # Periodic stream health assessment
+                current_time = time.time()
+                if current_time - last_health_check >= health_check_interval:
+                    is_healthy, health_message = self._assess_stream_health()
+                    if not is_healthy:
+                        logger.warning(f"Stream health issue for {self.camera_id}: {health_message}")
+                        # Force reconnection on persistent health issues
+                        if cap:
+                            logger.info(f"Forcing reconnection due to health issues for {self.camera_id}")
+                            cap.release()
+                            cap = None
+                    else:
+                        logger.debug(f"Stream health OK for {self.camera_id}: {health_message}")
+                    last_health_check = current_time
+                
                 # Check if we need to establish/re-establish connection
                 if cap is None or not cap.isOpened():
                     current_time = time.time()
@@ -330,15 +293,26 @@ class CameraWorker:
                         if not cap.isOpened():
                             raise ValueError(f"Cannot open camera stream: {url}")
                         
-                        # Test read a frame
+                        # Test read a frame and validate it
                         ret, test_frame = cap.read()
                         if not ret:
                             raise ValueError(f"Cannot read from camera stream: {url}")
+                        
+                        # Validate test frame
+                        is_valid, validation_error = self._validate_frame(test_frame)
+                        if not is_valid:
+                            raise ValueError(f"Invalid test frame: {validation_error}")
                         
                         # Connection successful
                         logger.info(f"SUB stream connected to {url} for {self.camera_id}")
                         connection_failures = 0
                         reconnection_delay = 5.0  # Reset delay
+                        
+                        # Reset health tracking
+                        self.frame_validation_failures = 0
+                        self.total_frames_processed = 0
+                        consecutive_frame_failures = 0
+                        last_valid_frame_time = time.time()
                         
                         # Clear error state
                         with self.lock:
@@ -368,18 +342,58 @@ class CameraWorker:
                 
                 # Read frame from established connection
                 ret, frame = cap.read()
+                self.total_frames_processed += 1
+                
                 if not ret:
                     logger.warning(f"Failed to read frame from SUB stream {self.camera_id}")
+                    consecutive_frame_failures += 1
                     
-                    # Mark connection as failed
-                    if cap:
-                        cap.release()
-                        cap = None
+                    # Mark connection as failed after consecutive failures
+                    if consecutive_frame_failures >= max_consecutive_frame_failures:
+                        logger.error(f"Too many consecutive frame read failures for {self.camera_id}, forcing reconnection")
+                        if cap:
+                            cap.release()
+                            cap = None
+                        consecutive_frame_failures = 0
                     
                     with self.lock:
                         self.error_message = "Frame read failed"
                         
                     time.sleep(1.0)  # Brief pause before reconnection
+                    continue
+                
+                # Validate frame quality
+                is_valid_frame, validation_error = self._validate_frame(frame)
+                if not is_valid_frame:
+                    self.frame_validation_failures += 1
+                    consecutive_frame_failures += 1
+                    
+                    logger.warning(f"Invalid frame from SUB stream {self.camera_id}: {validation_error}")
+                    
+                    # Check if too many consecutive validation failures
+                    if consecutive_frame_failures >= max_consecutive_frame_failures:
+                        logger.error(f"Too many consecutive frame validation failures for {self.camera_id}, forcing reconnection")
+                        if cap:
+                            cap.release()
+                            cap = None
+                        consecutive_frame_failures = 0
+                    
+                    with self.lock:
+                        self.error_message = f"Frame validation failed: {validation_error}"
+                    
+                    time.sleep(0.5)  # Brief pause before next frame
+                    continue
+                
+                # Frame is valid - reset consecutive failure counter
+                consecutive_frame_failures = 0
+                last_valid_frame_time = current_time
+                
+                # Check for frame gap (no valid frames for too long)
+                if current_time - last_valid_frame_time > max_frame_gap:
+                    logger.warning(f"No valid frames for {current_time - last_valid_frame_time:.1f}s for {self.camera_id}, forcing reconnection")
+                    if cap:
+                        cap.release()
+                        cap = None
                     continue
                 
                 # Frame processing
@@ -393,7 +407,7 @@ class CameraWorker:
                     frame_count = 0
                     last_fps_time = current_time
                 
-                # Motion detection with atomic trigger logic
+                # Motion detection with atomic trigger logic (unchanged from previous fix)
                 gray = preprocess_frame(frame)
                 if prev_frame is not None:
                     motion = detect_motion(
@@ -436,8 +450,13 @@ class CameraWorker:
                                 logger.debug(f"Motion ended for {self.camera_id}, resetting trigger state")
                             self.motion_start_time = None
                             self.motion_trigger_sent = False
-                
+                        
                 prev_frame = gray
+                
+                # Clear error state for healthy frame processing
+                if self.error_message and "Frame" in str(self.error_message):
+                    with self.lock:
+                        self.error_message = None
                 
                 # Small delay to prevent CPU overload
                 time.sleep(0.033)  # ~30 FPS max
@@ -460,6 +479,80 @@ class CameraWorker:
             cap.release()
             
         logger.info(f"SUB stream loop stopped for {self.camera_id}")
+
+    # 3. UPDATED _heartbeat_loop METHOD - Enhanced with frame health reporting
+    def _heartbeat_loop(self):
+        """Send periodic heartbeat with enhanced frame health reporting."""
+        logger.info(f"Starting heartbeat loop for {self.camera_id}")
+        
+        while self.running:
+            try:
+                # Thread-safe state collection
+                with self.lock:
+                    current_recording = self._recording
+                    current_fps = self.last_fps
+                    current_error = self.error_message
+                    
+                # Get recorder status safely
+                recorder_status = None
+                if self.recorder:
+                    try:
+                        recorder_status = self.recorder.get_recording_status()
+                    except Exception as e:
+                        logger.warning(f"Error getting recorder status: {e}")
+                
+                # Get frame health statistics
+                frame_health_info = ""
+                if hasattr(self, 'total_frames_processed') and self.total_frames_processed > 0:
+                    failure_rate = self.frame_validation_failures / self.total_frames_processed
+                    if failure_rate > 0.05:  # More than 5% failures worth reporting
+                        frame_health_info = f", frame_failures: {failure_rate:.1%}"
+                
+                # Determine stream state
+                if current_error:
+                    stream_state = "error"
+                elif current_recording:
+                    if recorder_status and recorder_status.get('failed'):
+                        stream_state = "recording_failed"
+                    else:
+                        stream_state = "recording"
+                elif current_fps > 0:
+                    stream_state = "capturing" 
+                else:
+                    stream_state = "idle"
+                
+                # Create and send heartbeat
+                heartbeat = HeartbeatMessage(
+                    worker_id=self.camera_id,
+                    timestamp=datetime.now().isoformat(),
+                    stream_state=stream_state,
+                    fps=current_fps,
+                    recording=current_recording,
+                    error_message=current_error
+                )
+                
+                self.status_queue.put_nowait(asdict(heartbeat))
+                
+                # Enhanced debug logging with frame health
+                if recorder_status:
+                    logger.debug(f"Heartbeat {self.camera_id}: {stream_state} (fps: {current_fps:.1f}, "
+                            f"duration: {self._get_recording_duration():.1f}s, "
+                            f"ffmpeg_restarts: {recorder_status.get('restart_count', 0)}{frame_health_info})")
+                else:
+                    logger.debug(f"Heartbeat {self.camera_id}: {stream_state} (fps: {current_fps:.1f}{frame_health_info})")
+                    
+                # Clear transient error messages after sending
+                if current_error and not current_error.startswith("Max connection failures"):
+                    with self.lock:
+                        if self.error_message == current_error:  # Only clear if unchanged
+                            self.error_message = None
+                    
+            except queue.Full:
+                logger.warning(f"Status queue full for worker {self.camera_id}")
+            except Exception as e:
+                logger.error(f"Error sending heartbeat from worker {self.camera_id}: {e}")
+                
+            time.sleep(5.0)  # Heartbeat every 5 seconds
                 
                     
     # camera_worker.py - Event Coordination Fix - Updated Methods
@@ -719,6 +812,92 @@ class CameraWorker:
             
         logger.info(f"Camera worker {self.camera_id} stopped")
 
+    # 1. NEW HELPER METHODS - Frame validation and stream health monitoring
+
+    def _validate_frame(self, frame) -> tuple[bool, str]:
+        """
+        Validate frame quality and detect corruption.
+        
+        Returns:
+            (is_valid, error_message)
+        """
+        try:
+            if frame is None:
+                return False, "Frame is None"
+            
+            if not isinstance(frame, np.ndarray):
+                return False, "Frame is not numpy array"
+            
+            if frame.size == 0:
+                return False, "Frame is empty"
+            
+            # Check frame dimensions
+            if len(frame.shape) < 2:
+                return False, "Invalid frame dimensions"
+            
+            height, width = frame.shape[:2]
+            
+            # Reasonable dimension checks
+            if height < 100 or width < 100:
+                return False, f"Frame too small: {width}x{height}"
+            
+            if height > 4096 or width > 4096:
+                return False, f"Frame too large: {width}x{height}"
+            
+            # Check for all-black or all-white frames (common corruption)
+            if len(frame.shape) == 3:  # Color frame
+                frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            else:
+                frame_gray = frame
+            
+            mean_brightness = np.mean(frame_gray)
+            std_brightness = np.std(frame_gray)
+            
+            # Detect completely black frames
+            if mean_brightness < 5 and std_brightness < 5:
+                return False, "Frame appears to be completely black"
+            
+            # Detect completely white/overexposed frames
+            if mean_brightness > 250 and std_brightness < 5:
+                return False, "Frame appears to be completely white/overexposed"
+            
+            # Check for reasonable data variance (not frozen frame)
+            if std_brightness < 0.1:
+                return False, "Frame appears frozen (no variance)"
+            
+            return True, ""
+            
+        except Exception as e:
+            return False, f"Frame validation error: {str(e)[:50]}"
+
+    def _assess_stream_health(self) -> tuple[bool, str]:
+        """
+        Assess overall stream health based on recent metrics.
+        
+        Returns:
+            (is_healthy, status_message)
+        """
+        try:
+            with self.lock:
+                current_fps = self.last_fps
+                
+            # FPS health check
+            expected_fps = self.camera_config.get('fps', 15)
+            min_acceptable_fps = expected_fps * 0.3  # 30% of expected FPS
+            
+            if current_fps < min_acceptable_fps:
+                return False, f"Low FPS: {current_fps:.1f} (expected: {expected_fps})"
+            
+            # Check frame validation failure rate
+            if hasattr(self, 'frame_validation_failures'):
+                failure_rate = self.frame_validation_failures / max(self.total_frames_processed, 1)
+                if failure_rate > 0.1:  # More than 10% failures
+                    return False, f"High frame validation failure rate: {failure_rate:.1%}"
+            
+            return True, "Stream healthy"
+            
+        except Exception as e:
+            return False, f"Health assessment error: {str(e)[:50]}"
 
 # For testing/debugging - can run worker standalone
 if __name__ == "__main__":

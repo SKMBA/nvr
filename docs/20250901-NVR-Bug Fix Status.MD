@@ -44,12 +44,12 @@ Let me analyze your code and identify the specific bugs that need fixing:
 
 ## 🟡3. Error Handling Gaps
 
-**🟡Issue 3.1: Silent OpenCV Failures**  
+**✅⏳Issue 3.1: Silent OpenCV Failures**  
 - **Location:** `camera_worker.py` `_sub_stream_loop()`  
 - **Problem:** `cap.read()` failures only log warning, no recovery  
 - **Impact:** Workers become unresponsive without supervisor knowing  
 
-**Issue 3.2: Queue Exception Handling**  
+**🟡Issue 3.2: Queue Exception Handling**  
 - **Location:** `camera_worker.py` heartbeat and command loops  
 - **Problem:** Queue operations can raise exceptions that aren't handled  
 - **Impact:** Worker threads may crash silently  
