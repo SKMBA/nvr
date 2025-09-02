@@ -49,12 +49,12 @@ Let me analyze your code and identify the specific bugs that need fixing:
 - **Problem:** `cap.read()` failures only log warning, no recovery  
 - **Impact:** Workers become unresponsive without supervisor knowing  
 
-**🟡Issue 3.2: Queue Exception Handling**  
+**✅⏳Issue 3.2: Queue Exception Handling**  
 - **Location:** `camera_worker.py` heartbeat and command loops  
 - **Problem:** Queue operations can raise exceptions that aren't handled  
 - **Impact:** Worker threads may crash silently  
 
-**Issue 3.3: Missing Process Health Monitoring**  
+**🟡Issue 3.3: Missing Process Health Monitoring**  
 - **Location:** `camera_worker.py` - no monitoring of FFmpeg subprocess  
 - **Problem:** If FFmpeg dies, worker doesn't know  
 - **Impact:** Recording failures not detected  

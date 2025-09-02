@@ -160,45 +160,133 @@ class CameraWorker:
         finally:
             self.stop()
             
+    # 3. UPDATED stop METHOD - Safe queue cleanup and exception handling
     def stop(self):
-        """Stop worker and all threads."""
+        """Stop worker and all threads with safe queue cleanup."""
         logger.info(f"Stopping camera worker {self.camera_id}")
         
         with self.lock:
             self.running = False
+            
+        # Set stop recording event to break any active recording loops
+        try:
             self.stop_recording_event.set()
+        except Exception as e:
+            logger.warning(f"Error setting stop recording event for {self.camera_id}: {e}")
             
         # Stop recording if active
         if self.recorder:
             try:
                 self.recorder.stop_recording()
             except Exception as e:
-                logger.error(f"Error stopping recorder: {e}")
+                logger.error(f"Error stopping recorder for {self.camera_id}: {e}")
                 
-        # Wait for threads to finish
-        for thread in [self.heartbeat_thread, self.command_thread, self.sub_thread, self.main_thread]:
+        # Wait for threads to finish with individual timeout handling
+        thread_info = [
+            ("heartbeat", self.heartbeat_thread),
+            ("command", self.command_thread), 
+            ("sub_stream", self.sub_thread),
+            ("main_stream", self.main_thread)
+        ]
+        
+        for thread_name, thread in thread_info:
             if thread and thread.is_alive():
-                thread.join(timeout=2.0)
+                try:
+                    logger.debug(f"Waiting for {thread_name} thread to stop for {self.camera_id}")
+                    thread.join(timeout=2.0)
+                    
+                    if thread.is_alive():
+                        logger.warning(f"{thread_name} thread did not stop gracefully for {self.camera_id}")
+                    else:
+                        logger.debug(f"{thread_name} thread stopped for {self.camera_id}")
+                        
+                except Exception as e:
+                    logger.error(f"Error stopping {thread_name} thread for {self.camera_id}: {e}")
+        
+        # Safe queue cleanup - drain remaining messages to prevent memory leaks
+        try:
+            # Drain command queue
+            drained_commands = 0
+            while True:
+                try:
+                    self.cmd_queue.get_nowait()
+                    drained_commands += 1
+                    if drained_commands > 100:  # Safety limit
+                        break
+                except queue.Empty:
+                    break
+                except Exception as e:
+                    logger.warning(f"Error draining command queue for {self.camera_id}: {e}")
+                    break
+                    
+            if drained_commands > 0:
+                logger.debug(f"Drained {drained_commands} commands from queue for {self.camera_id}")
                 
-        logger.info(f"Camera worker {self.camera_id} stopped")
-       
+        except Exception as e:
+            logger.warning(f"Error during queue cleanup for {self.camera_id}: {e}")
+        
+        # Clear all events after threads stop
+        try:
+            self.recording_event.clear()
+            self.stop_recording_event.clear()
+        except Exception as e:
+            logger.warning(f"Error clearing events for {self.camera_id}: {e}")
             
+        logger.info(f"Camera worker {self.camera_id} stopped")
+
+
     def _command_loop(self):
-        """Process commands from supervisor."""
+        """Process commands from supervisor with robust queue exception handling."""
         logger.info(f"Starting command loop for {self.camera_id}")
+        
+        command_failures = 0
+        max_command_failures = 10
         
         while self.running:
             try:
-                # Non-blocking check for commands
+                # Enhanced command queue handling
                 try:
                     cmd_data = self.cmd_queue.get(timeout=1.0)
+                    command_failures = 0  # Reset failure count on successful get
+                    
+                    # Validate command data
+                    if not isinstance(cmd_data, dict):
+                        logger.warning(f"Invalid command data type for {self.camera_id}: {type(cmd_data)}")
+                        continue
+                    
                     self._handle_command(cmd_data)
+                    
                 except queue.Empty:
+                    # Normal timeout - continue loop
                     continue
                     
+                except (BrokenPipeError, ConnectionError, OSError) as e:
+                    command_failures += 1
+                    logger.error(f"Command queue connection error for worker {self.camera_id}: {e} (failure #{command_failures})")
+                    
+                    if command_failures >= max_command_failures:
+                        logger.critical(f"Command queue persistently unavailable for {self.camera_id}, supervisor may be dead")
+                        # Continue trying but with longer delays
+                        time.sleep(10.0)
+                    else:
+                        time.sleep(2.0)  # Brief delay before retry
+                        
+                except Exception as e:
+                    command_failures += 1
+                    logger.error(f"Error getting command for worker {self.camera_id}: {e} (failure #{command_failures})")
+                    
+                    if command_failures >= max_command_failures:
+                        logger.error(f"Too many command queue failures for {self.camera_id}")
+                        time.sleep(10.0)
+                    else:
+                        time.sleep(1.0)
+                        
             except Exception as e:
-                logger.error(f"Error processing command in worker {self.camera_id}: {e}")
+                logger.error(f"Critical error in command loop for {self.camera_id}: {e}")
+                time.sleep(5.0)  # Back off on critical errors
                 
+        logger.info(f"Command loop stopped for {self.camera_id}")
+
     # 2. UPDATED _sub_stream_loop METHOD - Enhanced with frame validation and health monitoring
     def _sub_stream_loop(self):
         """SUB stream thread - enhanced with frame validation and silent failure detection."""
@@ -481,9 +569,13 @@ class CameraWorker:
         logger.info(f"SUB stream loop stopped for {self.camera_id}")
 
     # 3. UPDATED _heartbeat_loop METHOD - Enhanced with frame health reporting
+    # 1. UPDATED _heartbeat_loop METHOD - Comprehensive queue exception handling
     def _heartbeat_loop(self):
-        """Send periodic heartbeat with enhanced frame health reporting."""
+        """Send periodic heartbeat with comprehensive queue exception handling."""
         logger.info(f"Starting heartbeat loop for {self.camera_id}")
+        
+        heartbeat_failures = 0
+        max_heartbeat_failures = 5
         
         while self.running:
             try:
@@ -521,42 +613,68 @@ class CameraWorker:
                 else:
                     stream_state = "idle"
                 
-                # Create and send heartbeat
-                heartbeat = HeartbeatMessage(
-                    worker_id=self.camera_id,
-                    timestamp=datetime.now().isoformat(),
-                    stream_state=stream_state,
-                    fps=current_fps,
-                    recording=current_recording,
-                    error_message=current_error
-                )
+                # Create heartbeat message
+                try:
+                    heartbeat = HeartbeatMessage(
+                        worker_id=self.camera_id,
+                        timestamp=datetime.now().isoformat(),
+                        stream_state=stream_state,
+                        fps=current_fps,
+                        recording=current_recording,
+                        error_message=current_error
+                    )
+                    heartbeat_dict = asdict(heartbeat)
+                except Exception as e:
+                    logger.error(f"Error creating heartbeat message for {self.camera_id}: {e}")
+                    continue
                 
-                self.status_queue.put_nowait(asdict(heartbeat))
-                
-                # Enhanced debug logging with frame health
-                if recorder_status:
-                    logger.debug(f"Heartbeat {self.camera_id}: {stream_state} (fps: {current_fps:.1f}, "
-                            f"duration: {self._get_recording_duration():.1f}s, "
-                            f"ffmpeg_restarts: {recorder_status.get('restart_count', 0)}{frame_health_info})")
-                else:
-                    logger.debug(f"Heartbeat {self.camera_id}: {stream_state} (fps: {current_fps:.1f}{frame_health_info})")
+                # Send heartbeat with comprehensive exception handling
+                try:
+                    self.status_queue.put_nowait(heartbeat_dict)
+                    heartbeat_failures = 0  # Reset failure count on success
                     
-                # Clear transient error messages after sending
-                if current_error and not current_error.startswith("Max connection failures"):
+                    # Enhanced debug logging with frame health
+                    if recorder_status:
+                        logger.debug(f"Heartbeat {self.camera_id}: {stream_state} (fps: {current_fps:.1f}, "
+                                f"duration: {self._get_recording_duration():.1f}s, "
+                                f"ffmpeg_restarts: {recorder_status.get('restart_count', 0)}{frame_health_info})")
+                    else:
+                        logger.debug(f"Heartbeat {self.camera_id}: {stream_state} (fps: {current_fps:.1f}{frame_health_info})")
+                        
+                except queue.Full:
+                    heartbeat_failures += 1
+                    logger.warning(f"Status queue full for worker {self.camera_id} (failure #{heartbeat_failures})")
+                    
+                    if heartbeat_failures >= max_heartbeat_failures:
+                        logger.error(f"Too many heartbeat failures for {self.camera_id}, supervisor may be unresponsive")
+                        # Don't break - keep trying, but log the issue
+                        
+                except (BrokenPipeError, ConnectionError, OSError) as e:
+                    logger.error(f"Queue connection error for worker {self.camera_id}: {e}")
+                    # These indicate supervisor process issues - continue trying
+                    heartbeat_failures += 1
+                    
+                except Exception as e:
+                    heartbeat_failures += 1
+                    logger.error(f"Unexpected error sending heartbeat from worker {self.camera_id}: {e}")
+                    
+                    if heartbeat_failures >= max_heartbeat_failures:
+                        logger.critical(f"Critical heartbeat failure for {self.camera_id}, worker may be isolated")
+                
+                # Clear transient error messages after successful heartbeat
+                if heartbeat_failures == 0 and current_error and not current_error.startswith("Max connection failures"):
                     with self.lock:
                         if self.error_message == current_error:  # Only clear if unchanged
                             self.error_message = None
                     
-            except queue.Full:
-                logger.warning(f"Status queue full for worker {self.camera_id}")
             except Exception as e:
-                logger.error(f"Error sending heartbeat from worker {self.camera_id}: {e}")
+                logger.error(f"Critical error in heartbeat loop for {self.camera_id}: {e}")
+                time.sleep(10.0)  # Back off significantly on critical errors
+                continue
                 
             time.sleep(5.0)  # Heartbeat every 5 seconds
-                
-                    
-    # camera_worker.py - Event Coordination Fix - Updated Methods
 
+    # camera_worker.py - Event Coordination Fix - Updated Methods
     # 1. UPDATED _main_stream_loop METHOD - Enhanced event coordination
     def _main_stream_loop(self):
         """MAIN stream thread - handles recording with improved event coordination."""
@@ -642,40 +760,76 @@ class CameraWorker:
             self.stop_recording_event.clear()
 
     # 2. UPDATED _handle_command METHOD - Improved external command handling
+    # 4. UPDATED _handle_command METHOD - Enhanced exception handling for command processing
     def _handle_command(self, cmd_data: Dict[str, Any]):
-        """Handle commands from supervisor with proper event coordination."""
+        """Handle commands from supervisor with comprehensive exception handling."""
         try:
+            # Validate command structure
+            if not cmd_data:
+                logger.warning(f"Empty command received for worker {self.camera_id}")
+                return
+                
             command = cmd_data.get('command')
-            logger.info(f"Worker {self.camera_id} received command: {command}")
+            if not command:
+                logger.warning(f"Command missing 'command' field for worker {self.camera_id}: {cmd_data}")
+                return
+                
+            logger.info(f"Worker {self.camera_id} processing command: {command}")
             
-            if command == "stop":
-                logger.info(f"Stop command received for worker {self.camera_id}")
-                self.stop()
-                
-            elif command == "start_recording":
-                logger.info(f"Manual start recording command for {self.camera_id}")
-                # Use the same event mechanism as motion detection
-                if not self._is_recording():
-                    self.recording_event.set()
-                else:
-                    logger.info(f"Recording already active for {self.camera_id}")
+            # Process commands with individual exception handling
+            try:
+                if command == "stop":
+                    logger.info(f"Stop command received for worker {self.camera_id}")
+                    self.stop()
                     
-            elif command == "stop_recording":
-                logger.info(f"Manual stop recording command for {self.camera_id}")
-                if self._is_recording():
-                    self.stop_recording_event.set()
-                else:
-                    logger.info(f"Recording not active for {self.camera_id}")
+                elif command == "start_recording":
+                    logger.info(f"Manual start recording command for {self.camera_id}")
+                    if not self._is_recording():
+                        try:
+                            self.recording_event.set()
+                            logger.debug(f"Recording event set for {self.camera_id}")
+                        except Exception as e:
+                            logger.error(f"Error setting recording event for {self.camera_id}: {e}")
+                    else:
+                        logger.info(f"Recording already active for {self.camera_id}")
+                        
+                elif command == "stop_recording":
+                    logger.info(f"Manual stop recording command for {self.camera_id}")
+                    if self._is_recording():
+                        try:
+                            self.stop_recording_event.set()
+                            logger.debug(f"Stop recording event set for {self.camera_id}")
+                        except Exception as e:
+                            logger.error(f"Error setting stop recording event for {self.camera_id}: {e}")
+                    else:
+                        logger.info(f"Recording not active for {self.camera_id}")
+                        
+                elif command == "ptz_move":
+                    # PTZ commands with parameter validation
+                    params = cmd_data.get('params', {})
+                    if not isinstance(params, dict):
+                        logger.warning(f"Invalid PTZ params for {self.camera_id}: {params}")
+                        return
+                        
+                    logger.info(f"PTZ command received for {self.camera_id}: {params}")
+                    # PTZ implementation would go here
                     
-            elif command == "ptz_move":
-                # PTZ commands would be handled here
-                logger.info(f"PTZ command received: {cmd_data.get('params', {})}")
-                
-            else:
-                logger.warning(f"Unknown command: {command}")
+                else:
+                    logger.warning(f"Unknown command for {self.camera_id}: {command}")
+                    
+            except Exception as e:
+                logger.error(f"Error executing command '{command}' for {self.camera_id}: {e}")
                 
         except Exception as e:
-            logger.error(f"Error handling command {cmd_data}: {e}")
+            logger.error(f"Error handling command for {self.camera_id}: {e}, cmd_data: {cmd_data}")
+            
+            # Try to report error back to supervisor if possible
+            try:
+                with self.lock:
+                    self.error_message = f"Command error: {str(e)[:50]}..."
+            except:
+                pass  # If even this fails, just continue
+
 
     # 3. UPDATED _start_recording METHOD - Enhanced event state management
     def _start_recording(self):
