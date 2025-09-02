@@ -263,26 +263,6 @@ class CameraWorker:
             except Exception as e:
                 logger.error(f"Error processing command in worker {self.camera_id}: {e}")
                 
-    def _handle_command(self, cmd_data: Dict[str, Any]):
-        """Handle a command from the supervisor."""
-        try:
-            command = cmd_data.get('command')
-            logger.info(f"Worker {self.camera_id} received command: {command}")
-            
-            if command == "stop":
-                self.stop()
-            elif command == "start_recording":
-                self._start_recording()
-            elif command == "stop_recording":
-                self._stop_recording()
-            elif command == "ptz_move":
-                # PTZ commands would be handled here
-                logger.info(f"PTZ command received: {cmd_data.get('params', {})}")
-            else:
-                logger.warning(f"Unknown command: {command}")
-                
-        except Exception as e:
-            logger.error(f"Error handling command {cmd_data}: {e}")
             
     def _sub_stream_loop(self):
         """SUB stream thread - handles preview and motion detection with recovery."""
@@ -481,51 +461,132 @@ class CameraWorker:
             
         logger.info(f"SUB stream loop stopped for {self.camera_id}")
                 
+                    
+    # camera_worker.py - Event Coordination Fix - Updated Methods
+
+    # 1. UPDATED _main_stream_loop METHOD - Enhanced event coordination
     def _main_stream_loop(self):
-        """MAIN stream thread - handles recording with thread-safe coordination."""
+        """MAIN stream thread - handles recording with improved event coordination."""
         logger.info(f"Starting MAIN stream loop for {self.camera_id}")
         
         try:
             while self.running:
-                # Wait for recording trigger
+                # Wait for recording trigger with proper event handling
                 if self.recording_event.wait(timeout=1.0):
+                    # Clear recording event immediately to prevent duplicate processing
                     self.recording_event.clear()
+                    
+                    # Verify we should start recording (double-check state)
+                    if self._is_recording():
+                        logger.debug(f"Recording event received but already recording for {self.camera_id}")
+                        continue
+                    
+                    logger.debug(f"Recording event triggered for {self.camera_id}")
                     
                     # Start recording (state management handled internally)
                     self._start_recording()
                     
-                    # Record until stop signal or conditions met
-                    while (self.running and 
-                           self._is_recording() and  # Thread-safe check
-                           not self.stop_recording_event.wait(timeout=1.0)):
+                    # Only enter recording loop if recording actually started
+                    if self._is_recording():
+                        logger.debug(f"Entering recording loop for {self.camera_id}")
                         
-                        # Check FFmpeg health
-                        if self.recorder and not self.recorder.is_recording_healthy():
-                            logger.warning(f"FFmpeg recording failed for {self.camera_id}, stopping")
-                            break
+                        # Clear stop event before starting recording loop
+                        self.stop_recording_event.clear()
                         
-                        # Auto-stop logic with thread-safe access
-                        recording_duration = self._get_recording_duration()
-                        with self.lock:
-                            motion_detected = self.motion_detected
+                        # Record until stop conditions met
+                        recording_start_time = time.time()
+                        last_health_check = time.time()
+                        
+                        while (self.running and 
+                            self._is_recording()):
                             
-                        if not motion_detected and recording_duration > self.post_record_time:
-                            logger.info(f"Auto-stopping recording for {self.camera_id} (no motion, duration: {recording_duration:.1f}s)")
-                            break
+                            # Check for external stop signal (non-blocking)
+                            if self.stop_recording_event.is_set():
+                                logger.info(f"Stop recording event received for {self.camera_id}")
+                                break
                             
-                    # Stop recording (state management handled internally)
-                    self._stop_recording()
-                    self.stop_recording_event.clear()
-                    
+                            # Periodic health checks (every 2 seconds)
+                            current_time = time.time()
+                            if current_time - last_health_check >= 2.0:
+                                # Check FFmpeg health
+                                if self.recorder and not self.recorder.is_recording_healthy():
+                                    logger.warning(f"FFmpeg recording failed for {self.camera_id}, stopping")
+                                    break
+                                
+                                last_health_check = current_time
+                            
+                            # Auto-stop logic with thread-safe access
+                            recording_duration = self._get_recording_duration()
+                            with self.lock:
+                                motion_detected = self.motion_detected
+                                
+                            if not motion_detected and recording_duration > self.post_record_time:
+                                logger.info(f"Auto-stopping recording for {self.camera_id} (no motion, duration: {recording_duration:.1f}s)")
+                                break
+                            
+                            # Short wait to prevent busy loop
+                            time.sleep(0.5)
+                            
+                        logger.debug(f"Exiting recording loop for {self.camera_id}")
+                        
+                        # Stop recording (state management handled internally)
+                        self._stop_recording()
+                        
+                        # Clear both events after recording ends
+                        self.stop_recording_event.clear()
+                        
+                    else:
+                        logger.warning(f"Failed to start recording for {self.camera_id} despite event trigger")
+                        
         except Exception as e:
             logger.error(f"Error in MAIN stream loop for {self.camera_id}: {e}")
             with self.lock:
                 self.error_message = f"MAIN stream error: {e}"
                 self._set_recording_state(False)  # Ensure state is cleared
+                
+            # Clear events on error
+            self.recording_event.clear()
+            self.stop_recording_event.clear()
+
+    # 2. UPDATED _handle_command METHOD - Improved external command handling
+    def _handle_command(self, cmd_data: Dict[str, Any]):
+        """Handle commands from supervisor with proper event coordination."""
+        try:
+            command = cmd_data.get('command')
+            logger.info(f"Worker {self.camera_id} received command: {command}")
+            
+            if command == "stop":
+                logger.info(f"Stop command received for worker {self.camera_id}")
+                self.stop()
+                
+            elif command == "start_recording":
+                logger.info(f"Manual start recording command for {self.camera_id}")
+                # Use the same event mechanism as motion detection
+                if not self._is_recording():
+                    self.recording_event.set()
+                else:
+                    logger.info(f"Recording already active for {self.camera_id}")
                     
-    # 3. UPDATED _start_recording METHOD - Reset motion trigger state  
+            elif command == "stop_recording":
+                logger.info(f"Manual stop recording command for {self.camera_id}")
+                if self._is_recording():
+                    self.stop_recording_event.set()
+                else:
+                    logger.info(f"Recording not active for {self.camera_id}")
+                    
+            elif command == "ptz_move":
+                # PTZ commands would be handled here
+                logger.info(f"PTZ command received: {cmd_data.get('params', {})}")
+                
+            else:
+                logger.warning(f"Unknown command: {command}")
+                
+        except Exception as e:
+            logger.error(f"Error handling command {cmd_data}: {e}")
+
+    # 3. UPDATED _start_recording METHOD - Enhanced event state management
     def _start_recording(self):
-        """Start FFmpeg recording - thread-safe with motion state reset."""
+        """Start FFmpeg recording - thread-safe with enhanced event coordination."""
         try:
             # Thread-safe state change
             if not self._set_recording_state(True):
@@ -536,6 +597,8 @@ class CameraWorker:
             with self.lock:
                 self.motion_trigger_sent = False  # Allow new triggers after recording ends
                 
+            logger.debug(f"Starting FFmpeg recording for {self.camera_id}")
+            
             # Get main stream URL
             main_url = self.camera_config.get('url')
             if not main_url:
@@ -561,22 +624,36 @@ class CameraWorker:
             self.recorder.start_recording()
             logger.info(f"Started recording for {self.camera_id}: {output_file}")
             
+            # Clear any pending recording events after successful start
+            try:
+                self.recording_event.clear()
+            except:
+                pass
+            
         except Exception as e:
             logger.error(f"Failed to start recording for {self.camera_id}: {e}")
             with self.lock:
                 self.error_message = f"Recording start error: {e}"
                 self._set_recording_state(False)  # Clear state on failure
                 self.motion_trigger_sent = False  # Reset trigger state on failure
+                
+            # Clear recording event on failure
+            try:
+                self.recording_event.clear()
+            except:
+                pass
 
-    # 4. UPDATED _stop_recording METHOD - Reset motion trigger state
+    # 4. UPDATED _stop_recording METHOD - Enhanced event state management  
     def _stop_recording(self):
-        """Stop FFmpeg recording - thread-safe with motion state reset."""
+        """Stop FFmpeg recording - thread-safe with enhanced event coordination."""
         try:
             # Thread-safe state change  
             if not self._set_recording_state(False):
                 logger.debug(f"Recording already stopped for {self.camera_id}")
                 return
                 
+            logger.debug(f"Stopping FFmpeg recording for {self.camera_id}")
+            
             # Reset motion trigger state when recording stops
             with self.lock:
                 self.motion_trigger_sent = False  # Allow new motion triggers
@@ -588,13 +665,59 @@ class CameraWorker:
                 
             logger.info(f"Stopped recording for {self.camera_id}")
             
+            # Clear stop recording event after successful stop
+            try:
+                self.stop_recording_event.clear()
+            except:
+                pass
+            
         except Exception as e:
             logger.error(f"Failed to stop recording for {self.camera_id}: {e}")
             with self.lock:
                 self.error_message = f"Recording stop error: {e}"
                 self.motion_trigger_sent = False  # Reset trigger state on error
             # State already set to False by _set_recording_state above
+            
+            # Clear events on error
+            try:
+                self.stop_recording_event.clear()
+            except:
+                pass
 
+    # 5. UPDATED stop METHOD - Clean event cleanup on worker shutdown
+    def stop(self):
+        """Stop worker and all threads with proper event cleanup."""
+        logger.info(f"Stopping camera worker {self.camera_id}")
+        
+        with self.lock:
+            self.running = False
+            
+        # Set stop recording event to break any active recording loops
+        try:
+            self.stop_recording_event.set()
+        except:
+            pass
+            
+        # Stop recording if active
+        if self.recorder:
+            try:
+                self.recorder.stop_recording()
+            except Exception as e:
+                logger.error(f"Error stopping recorder: {e}")
+                
+        # Wait for threads to finish
+        for thread in [self.heartbeat_thread, self.command_thread, self.sub_thread, self.main_thread]:
+            if thread and thread.is_alive():
+                thread.join(timeout=2.0)
+                
+        # Clear all events after threads stop
+        try:
+            self.recording_event.clear()
+            self.stop_recording_event.clear()
+        except:
+            pass
+            
+        logger.info(f"Camera worker {self.camera_id} stopped")
 
 
 # For testing/debugging - can run worker standalone
