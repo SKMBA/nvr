@@ -28,23 +28,23 @@ Let me analyze your code and identify the specific bugs that need fixing:
 
 ---
 
-## 🟡2. Worker Thread Synchronization Bugs
+## ⏳2. Worker Thread Synchronization Bugs
 
-**⏳⚠️🟡Issue 2.1: Race Condition in Recording State**  
+**✅⏳⚠️🟡Issue 2.1: Race Condition in Recording State**  
 - **Location:** `camera_worker.py` - recording state shared between threads  
 - **Problem:** `self.recording` accessed without consistent locking  
 - **Impact:** Recording may not start/stop properly  
 
-**Issue 2.2: Event Coordination Issues**  
+**✅⏳Issue 2.2: Event Coordination Issues**  
 - **Location:** `camera_worker.py` `_main_stream_loop()`  
 - **Problem:** `recording_event` and `stop_recording_event` coordination  
 - **Impact:** Recording threads may miss triggers or hang  
 
 ---
 
-## 3. Error Handling Gaps
+## 🟡3. Error Handling Gaps
 
-**Issue 3.1: Silent OpenCV Failures**  
+**🟡Issue 3.1: Silent OpenCV Failures**  
 - **Location:** `camera_worker.py` `_sub_stream_loop()`  
 - **Problem:** `cap.read()` failures only log warning, no recovery  
 - **Impact:** Workers become unresponsive without supervisor knowing  
