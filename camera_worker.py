@@ -170,10 +170,12 @@ class CameraWorker:
             self.stop()
             
     # 3. UPDATED stop METHOD - Safe queue cleanup and exception handling
+  # 3. UPDATED stop METHOD - Safe queue cleanup and exception handling
     def stop(self):
         """Stop worker and all threads with safe queue cleanup."""
+        """Stop worker and all threads with enhanced resource cleanup."""
         logger.info(f"Stopping camera worker {self.camera_id}")
-        
+
         with self.lock:
             self.running = False
             
@@ -241,8 +243,17 @@ class CameraWorker:
         except Exception as e:
             logger.warning(f"Error clearing events for {self.camera_id}: {e}")
             
-        logger.info(f"Camera worker {self.camera_id} stopped")
-
+        # Additional cleanup - force release any remaining OpenCV resources
+        # This is a safety net in case the SUB thread didn't clean up properly
+        try:
+            # Force garbage collection to help release any unreferenced objects
+            import gc
+            gc.collect()
+            logger.debug(f"Forced garbage collection for {self.camera_id}")
+        except Exception as e:
+            logger.warning(f"Error during garbage collection for {self.camera_id}: {e}")
+            
+        logger.info(f"Camera worker {self.camera_id} stopped with enhanced cleanup")
 
     def _command_loop(self):
         """Process commands from supervisor with robust queue exception handling."""
@@ -301,20 +312,20 @@ class CameraWorker:
     def _sub_stream_loop(self):
         # """SUB stream thread - enhanced with frame validation and silent failure detection."""
         # """SUB stream thread - enhanced with recording-aware error reporting."""
+        """SUB stream thread - enhanced with comprehensive resource management."""
         logger.info(f"Starting SUB stream loop for {self.camera_id} (preview and motion detection)")
-        
         cap = None
         prev_frame = None
         frame_count = 0
         last_fps_time = time.time()
-        
+
         # Connection tracking
         connection_failures = 0
-        max_connection_failures = 15
+        max_connection_failures = 5
         last_connection_attempt = 0
         reconnection_delay = 5.0
         max_reconnection_delay = 60.0
-        
+
         # Frame health tracking
         self.frame_validation_failures = 0
         self.total_frames_processed = 0
@@ -322,268 +333,313 @@ class CameraWorker:
         max_consecutive_frame_failures = 10
         last_health_check = time.time()
         health_check_interval = 30.0  # Check stream health every 30 seconds
-        
+
         # Frame quality tracking
         last_valid_frame_time = time.time()
         max_frame_gap = 5.0  # Maximum seconds without valid frame
         
-        while self.running:
-            try:
-                # Periodic stream health assessment
-                current_time = time.time()
-                if current_time - last_health_check >= health_check_interval:
-                    is_healthy, health_message = self._assess_stream_health()
-                    if not is_healthy:
-                        # Enhanced logging for recording awareness
-                        recording_status = "during recording" if self._is_recording() else "while idle"
-                        logger.warning(f"Stream health issue for {self.camera_id} {recording_status}: {health_message}")
-	                    
-                        # Force reconnection on persistent health issues
-                        if cap:
-                            logger.info(f"Forcing reconnection due to health issues for {self.camera_id}")
-                            cap.release()
-                            cap = None
-                    else:
-                        logger.debug(f"Stream health OK for {self.camera_id}: {health_message}")
-                    last_health_check = current_time
-                
-                # Check if we need to establish/re-establish connection
-                if cap is None or not cap.isOpened():
+        try:
+            while self.running:
+                try:
+                    # Periodic stream health assessment
                     current_time = time.time()
+                    if current_time - last_health_check >= health_check_interval:
+                        is_healthy, health_message = self._assess_stream_health()
+                        if not is_healthy:
+                            # Enhanced logging for recording awareness
+                            recording_status = "during recording" if self._is_recording() else "while idle"
+                            logger.warning(f"Stream health issue for {self.camera_id} {recording_status}: {health_message}")
+                            
+                            # Force reconnection on persistent health issues - ensure cleanup
+                            if cap:
+                                logger.info(f"Forcing reconnection due to health issues for {self.camera_id}")
+                                self._safe_release_capture(cap)
+                                cap = None
+                        else:
+                            logger.debug(f"Stream health OK for {self.camera_id}: {health_message}")
+                        last_health_check = current_time
                     
-                    # Rate limit reconnection attempts
-                    if current_time - last_connection_attempt < reconnection_delay:
-                        time.sleep(0.1)
-                        continue
+                    # Connection establishment with comprehensive resource management
+                    if cap is None or not cap.isOpened():
+                        current_time = time.time()
                         
-                    last_connection_attempt = current_time
-                    
-                    # Release old capture if exists
-                    if cap:
-                        cap.release()
-                        cap = None
-                    
-                    # Get camera URL with fallback
-                    logger.info(f"Attempting to connect SUB stream for {self.camera_id}")
-                    url = CameraHelper.get_camera_sub_url(self.camera_id, timeout=2.0)
-                    if not url:
-                        logger.warning(f"SUB stream not available, fallback to MAIN stream for {self.camera_id}")
-                        url = CameraHelper.get_camera_main_url(self.camera_id, timeout=2.0)
-
-                    if not url:
-                        connection_failures += 1
-                        # Enhanced error reporting with recording awareness
-                        recording_context = " (RECORDING ACTIVE - may stop soon)" if self._is_recording() else ""
-                        logger.critical(f"Both MAIN and SUB streams unreachable for Camera {self.camera_id} (failures: {connection_failures}/{max_connection_failures}){recording_context}")
+                        # Rate limit reconnection attempts
+                        if current_time - last_connection_attempt < reconnection_delay:
+                            time.sleep(0.1)
+                            continue
+                            
+                        last_connection_attempt = current_time
                         
-                        # Report error to supervisor via heartbeat
-                        with self.lock:
-                            self.error_message = f"Both MAIN and SUB streams unreachable (failures: {connection_failures})"
-
-                        if connection_failures >= max_connection_failures:
-                            logger.critical(f"Max connection failures reached for {self.camera_id}, stopping SUB stream")
+                        # Ensure any existing capture is properly released
+                        if cap is not None:
+                            self._safe_release_capture(cap)
+                            cap = None
+                        
+                        # Get camera URL with fallback
+                        logger.info(f"Attempting to connect SUB stream for {self.camera_id}")
+                        url = CameraHelper.get_camera_sub_url(self.camera_id, timeout=2.0)
+                        if not url:
+                            logger.warning(f"SUB stream not available, fallback to MAIN stream for {self.camera_id}")
+                            url = CameraHelper.get_camera_main_url(self.camera_id, timeout=2.0)
+    
+                        if not url:
+                            connection_failures += 1
+                            # Enhanced error reporting with recording awareness
+                            recording_context = " (RECORDING ACTIVE - may stop soon)" if self._is_recording() else ""
+                            logger.critical(f"Both MAIN and SUB streams unreachable for Camera {self.camera_id} (failures: {connection_failures}/{max_connection_failures}){recording_context}")
+                            
+                            # Report error to supervisor via heartbeat
                             with self.lock:
-                                self.error_message = "Max connection failures reached"
-                            break
+                                self.error_message = f"Both MAIN and SUB streams unreachable (failures: {connection_failures})"
+                            
+                            if connection_failures >= max_connection_failures:
+                                logger.critical(f"Max connection failures reached for {self.camera_id}, stopping SUB stream")
+                                with self.lock:
+                                    self.error_message = "Max connection failures reached"
+                                break
+                            
+                            # Exponential backoff
+                            reconnection_delay = min(reconnection_delay * 1.5, max_reconnection_delay)
+                            time.sleep(reconnection_delay)
+                            continue
                         
-                        # Exponential backoff
-                        reconnection_delay = min(reconnection_delay * 1.5, max_reconnection_delay)
-                        time.sleep(reconnection_delay)
+                        # Connection attempt with guaranteed resource cleanup on failure
+                        temp_cap = None
+                        try:
+                            logger.debug(f"Creating VideoCapture for {url}")
+                            temp_cap = cv2.VideoCapture(url)
+                            
+                            if not temp_cap.isOpened():
+                                raise ValueError(f"Cannot open camera stream: {url}")
+                            
+                            # Test read a frame and validate it
+                            ret, test_frame = temp_cap.read()
+                            if not ret:
+                                raise ValueError(f"Cannot read from camera stream: {url}")
+                            
+                            # Validate test frame
+                            is_valid, validation_error = self._validate_frame(test_frame)
+                            if not is_valid:
+                                raise ValueError(f"Invalid test frame: {validation_error}")
+                            
+                            # Connection successful - assign to main variable
+                            cap = temp_cap
+                            temp_cap = None  # Prevent cleanup of successful connection
+                            
+                            logger.info(f"SUB stream connected to {url} for {self.camera_id}")
+                            connection_failures = 0
+                            reconnection_delay = 5.0  # Reset delay
+                            
+                            # Reset health tracking
+                            self.frame_validation_failures = 0
+                            self.total_frames_processed = 0
+                            consecutive_frame_failures = 0
+                            last_valid_frame_time = time.time()
+                            
+                            # Clear error state
+                            with self.lock:
+                                self.error_message = None
+                            
+                            # Reset frame tracking
+                            prev_frame = None
+                            frame_count = 0
+                            last_fps_time = time.time()
+                            
+                        except Exception as e:
+                            connection_failures += 1
+                            logger.warning(f"Failed to connect to {url} for {self.camera_id}: {e} (failures: {connection_failures}/{max_connection_failures})")
+                            
+                            # Ensure temporary capture is released on connection failure
+                            if temp_cap is not None:
+                                self._safe_release_capture(temp_cap)
+                                temp_cap = None
+                            
+                            # Report connection error
+                            with self.lock:
+                                self.error_message = f"Connection failed: {str(e)[:50]}..."
+                            
+                            # Exponential backoff
+                            reconnection_delay = min(reconnection_delay * 1.5, max_reconnection_delay)
+                            time.sleep(reconnection_delay)
+                            continue
+                    
+                    # Frame reading and processing with error handling
+                    try:
+                        ret, frame = cap.read()
+                        self.total_frames_processed += 1
+                        
+                        if not ret:
+                            logger.warning(f"Failed to read frame from SUB stream {self.camera_id}")
+                            consecutive_frame_failures += 1
+                            
+                            # Force reconnection after consecutive failures
+                            if consecutive_frame_failures >= max_consecutive_frame_failures:
+                                logger.error(f"Too many consecutive frame read failures for {self.camera_id}, forcing reconnection")
+                                self._safe_release_capture(cap)
+                                cap = None
+                                consecutive_frame_failures = 0
+                            
+                            with self.lock:
+                                self.error_message = "Frame read failed"
+                                
+                            time.sleep(1.0)  # Brief pause before reconnection
+                            continue
+                        
+                        # Frame validation with error handling
+                        try:
+                            is_valid_frame, validation_error = self._validate_frame(frame)
+                            if not is_valid_frame:
+                                self.frame_validation_failures += 1
+                                consecutive_frame_failures += 1
+                                
+                                logger.warning(f"Invalid frame from SUB stream {self.camera_id}: {validation_error}")
+                                
+                                # Force reconnection on too many validation failures
+                                if consecutive_frame_failures >= max_consecutive_frame_failures:
+                                    logger.error(f"Too many consecutive frame validation failures for {self.camera_id}, forcing reconnection")
+                                    self._safe_release_capture(cap)
+                                    cap = None
+                                    consecutive_frame_failures = 0
+                                
+                                with self.lock:
+                                    self.error_message = f"Frame validation failed: {validation_error}"
+                                
+                                time.sleep(0.5)  # Brief pause before next frame
+                                continue
+                            
+                            # Frame is valid - reset failure counters
+                            consecutive_frame_failures = 0
+                            last_valid_frame_time = current_time
+                            
+                        except Exception as e:
+                            logger.error(f"Error during frame validation for {self.camera_id}: {e}")
+                            self._safe_release_capture(cap)
+                            cap = None
+                            continue
+                    
+                    except Exception as e:
+                        logger.error(f"Error reading frame from {self.camera_id}: {e}")
+                        self._safe_release_capture(cap)
+                        cap = None
                         continue
                     
-	                # Attempt connection (rest of the connection logic remains the same)
+                    # Check for frame gap (no valid frames for too long)
+                    if current_time - last_valid_frame_time > max_frame_gap:
+                        logger.warning(f"No valid frames for {current_time - last_valid_frame_time:.1f}s for {self.camera_id}, forcing reconnection")
+                        self._safe_release_capture(cap)
+                        cap = None
+                        continue
+                    
+                    # Frame processing with exception handling
                     try:
-                        cap = cv2.VideoCapture(url)
-                        if not cap.isOpened():
-                            raise ValueError(f"Cannot open camera stream: {url}")
+                        frame_count += 1
+                        current_time = time.time()
                         
-                        # Test read a frame and validate it
-                        ret, test_frame = cap.read()
-                        if not ret:
-                            raise ValueError(f"Cannot read from camera stream: {url}")
+                        # Calculate FPS
+                        if current_time - last_fps_time >= 2.0:
+                            with self.lock:
+                                self.last_fps = frame_count / (current_time - last_fps_time)
+                            frame_count = 0
+                            last_fps_time = current_time
                         
-                        # Validate test frame
-                        is_valid, validation_error = self._validate_frame(test_frame)
-                        if not is_valid:
-                            raise ValueError(f"Invalid test frame: {validation_error}")
+                        # Motion detection with atomic trigger logic
+                        gray = preprocess_frame(frame)
+                        if prev_frame is not None:
+                            motion = detect_motion(
+                                prev_frame, 
+                                gray, 
+                                self.camera_config.get('threshold', 25),
+                                self.camera_config.get('area', 500)
+                            )
+                            
+                            # Atomic motion trigger logic with proper synchronization
+                            with self.lock:
+                                self.motion_detected = motion
+                                currently_recording = self._recording
+                                current_time_for_motion = current_time
+                                
+                                # Handle motion recording logic
+                                if motion:
+                                    # Start motion timer if not started
+                                    if self.motion_start_time is None:
+                                        self.motion_start_time = current_time_for_motion
+                                        self.motion_trigger_sent = False  # Reset trigger flag
+                                        logger.debug(f"Motion started for {self.camera_id}, waiting {self.motion_timeout}s for confirmation")
+                                        
+                                    # Check if motion has been confirmed for required duration
+                                    elif (current_time_for_motion - self.motion_start_time >= self.motion_timeout and 
+                                          not self.motion_trigger_sent and 
+                                          not currently_recording):
+                                        
+                                        # Additional cooldown check to prevent rapid triggers
+                                        if current_time_for_motion - self.last_motion_trigger_time >= self.motion_trigger_cooldown:
+                                            logger.info(f"Motion confirmed for {self.camera_id}, triggering recording")
+                                            self.recording_event.set()
+                                            self.motion_trigger_sent = True # Mark trigger as sent
+                                            self.last_motion_trigger_time = current_time_for_motion
+                                        else:
+                                            logger.debug(f"Motion trigger cooldown active for {self.camera_id}")
+                                else:
+                                    # No motion detected - reset motion state
+                                    if self.motion_start_time is not None:
+                                        logger.debug(f"Motion ended for {self.camera_id}, resetting trigger state")
+                                    self.motion_start_time = None
+                                    self.motion_trigger_sent = False
+                            
+                        prev_frame = gray
                         
-                        # Connection successful
-                        logger.info(f"SUB stream connected to {url} for {self.camera_id}")
-                        connection_failures = 0
-                        reconnection_delay = 5.0  # Reset delay
-                        
-                        # Reset health tracking
-                        self.frame_validation_failures = 0
-                        self.total_frames_processed = 0
-                        consecutive_frame_failures = 0
-                        last_valid_frame_time = time.time()
-                        
-                        # Clear error state
-                        with self.lock:
-                            self.error_message = None
-                        
-                        # Reset frame tracking
-                        prev_frame = None
-                        frame_count = 0
-                        last_fps_time = time.time()
+                        # Clear error state for healthy frame processing
+                        if self.error_message and "Frame" in str(self.error_message):
+                            with self.lock:
+                                self.error_message = None
                         
                     except Exception as e:
-                        connection_failures += 1
-                        logger.warning(f"Failed to connect to {url} for {self.camera_id}: {e} (failures: {connection_failures}/{max_connection_failures})")
-                        
-                        if cap:
-                            cap.release()
-                            cap = None
-                        
-                        # Report connection error
-                        with self.lock:
-                            self.error_message = f"Connection failed: {str(e)[:50]}..."
-                        
-                        # Exponential backoff
-                        reconnection_delay = min(reconnection_delay * 1.5, max_reconnection_delay)
-                        time.sleep(reconnection_delay)
+                        logger.error(f"Error processing frame for {self.camera_id}: {e}")
+                        # Don't release capture for processing errors, just continue
                         continue
-                
-	            # Frame reading and processing logic (unchanged from previous implementation)
-                # Read frame from established connection
-                ret, frame = cap.read()
-                self.total_frames_processed += 1
-                
-                if not ret:
-                    logger.warning(f"Failed to read frame from SUB stream {self.camera_id}")
-                    consecutive_frame_failures += 1
                     
-                    # Mark connection as failed after consecutive failures
-                    if consecutive_frame_failures >= max_consecutive_frame_failures:
-                        logger.error(f"Too many consecutive frame read failures for {self.camera_id}, forcing reconnection")
-                        if cap:
-                            cap.release()
-                            cap = None
-                        consecutive_frame_failures = 0
+                    # Small delay to prevent CPU overload
+                    time.sleep(0.033)  # ~30 FPS max
                     
-                    with self.lock:
-                        self.error_message = "Frame read failed"
-                        
-                    time.sleep(1.0)  # Brief pause before reconnection
-                    continue
-                
-                # Validate frame quality
-                is_valid_frame, validation_error = self._validate_frame(frame)
-                if not is_valid_frame:
-                    self.frame_validation_failures += 1
-                    consecutive_frame_failures += 1
-                    
-                    logger.warning(f"Invalid frame from SUB stream {self.camera_id}: {validation_error}")
-                    
-                    # Check if too many consecutive validation failures
-                    if consecutive_frame_failures >= max_consecutive_frame_failures:
-                        logger.error(f"Too many consecutive frame validation failures for {self.camera_id}, forcing reconnection")
-                        if cap:
-                            cap.release()
-                            cap = None
-                        consecutive_frame_failures = 0
-                    
-                    with self.lock:
-                        self.error_message = f"Frame validation failed: {validation_error}"
-                    
-                    time.sleep(0.5)  # Brief pause before next frame
-                    continue
-                
-                # Frame is valid - reset consecutive failure counter
-                consecutive_frame_failures = 0
-                last_valid_frame_time = current_time
-                
-                # Check for frame gap (no valid frames for too long)
-                if current_time - last_valid_frame_time > max_frame_gap:
-                    logger.warning(f"No valid frames for {current_time - last_valid_frame_time:.1f}s for {self.camera_id}, forcing reconnection")
-                    if cap:
-                        cap.release()
-                        cap = None
-                    continue
-                
-                # Frame processing
-                frame_count += 1
-                current_time = time.time()
-                
-                # Calculate FPS
-                if current_time - last_fps_time >= 2.0:
-                    with self.lock:
-                        self.last_fps = frame_count / (current_time - last_fps_time)
-                    frame_count = 0
-                    last_fps_time = current_time
-                
-	            # Motion detection with atomic trigger logic (unchanged from previous implementation)
-                gray = preprocess_frame(frame)
-                if prev_frame is not None:
-                    motion = detect_motion(
-                        prev_frame, 
-                        gray, 
-                        self.camera_config.get('threshold', 25),
-                        self.camera_config.get('area', 500)
-                    )
-                    
-                    # Atomic motion trigger logic with proper synchronization
-                    with self.lock:
-                        self.motion_detected = motion
-                        currently_recording = self._recording
-                        current_time_for_motion = current_time
-                        
-                        # Handle motion recording logic
-                        if motion:
-                            # Start motion timer if not started
-                            if self.motion_start_time is None:
-                                self.motion_start_time = current_time_for_motion
-                                self.motion_trigger_sent = False  # Reset trigger flag
-                                logger.debug(f"Motion started for {self.camera_id}, waiting {self.motion_timeout}s for confirmation")
-                                
-                            # Check if motion has been confirmed for required duration
-                            elif (current_time_for_motion - self.motion_start_time >= self.motion_timeout and 
-                                not self.motion_trigger_sent and 
-                                not currently_recording):
-                                
-                                # Additional cooldown check to prevent rapid triggers
-                                if current_time_for_motion - self.last_motion_trigger_time >= self.motion_trigger_cooldown:
-                                    logger.info(f"Motion confirmed for {self.camera_id}, triggering recording")
-                                    self.recording_event.set()
-                                    self.motion_trigger_sent = True  # Mark trigger as sent
-                                    self.last_motion_trigger_time = current_time_for_motion
-                                else:
-                                    logger.debug(f"Motion trigger cooldown active for {self.camera_id}")
-                        else:
-                            # No motion detected - reset motion state
-                            if self.motion_start_time is not None:
-                                logger.debug(f"Motion ended for {self.camera_id}, resetting trigger state")
-                            self.motion_start_time = None
-                            self.motion_trigger_sent = False
-                        
-                prev_frame = gray
-                
-                # Clear error state for healthy frame processing
-                if self.error_message and "Frame" in str(self.error_message):
-                    with self.lock:
-                        self.error_message = None
-                
-                # Small delay to prevent CPU overload
-                time.sleep(0.033)  # ~30 FPS max
-                
-            except Exception as e:
-                logger.error(f"Unexpected error in SUB stream loop for {self.camera_id}: {e}")
-                
-                # Release resources on error
-                if cap:
-                    cap.release()
+                except Exception as e:
+                    logger.error(f"Unexpected error in SUB stream inner loop for {self.camera_id}: {e}")
+                    # Release capture on unexpected errors and force reconnection
+                    self._safe_release_capture(cap)
                     cap = None
                     
-                with self.lock:
-                    self.error_message = f"Unexpected error: {str(e)[:50]}..."
-                    
-                time.sleep(5.0)  # Back off on unexpected errors
+                    with self.lock:
+                        self.error_message = f"Unexpected error: {str(e)[:50]}..."
+                        
+                    time.sleep(5.0)  # Back off on unexpected errors
         
-        # Cleanup
-        if cap:
-            cap.release()
+        except Exception as e:
+            logger.error(f"Critical error in SUB stream main loop for {self.camera_id}: {e}")
+            
+        finally:
+            # Guaranteed cleanup - ensure capture is always released
+            logger.debug(f"SUB stream loop cleanup for {self.camera_id}")
+            self._safe_release_capture(cap)
+            cap = None
             
         logger.info(f"SUB stream loop stopped for {self.camera_id}")
+
+ 
+    # camera_worker.py - OpenCV VideoCapture Resource Management Fix
+    def _safe_release_capture(self, cap):
+        """
+        Safely release OpenCV VideoCapture with error handling.
+        
+        Args:
+            cap: OpenCV VideoCapture object to release
+        """
+        if cap is not None:
+            try:
+                if cap.isOpened():
+                    cap.release()
+                logger.debug(f"VideoCapture released for {self.camera_id}")
+            except Exception as e:
+                logger.warning(f"Error releasing VideoCapture for {self.camera_id}: {e}")
+
 
     # 3. UPDATED _heartbeat_loop METHOD - Enhanced with frame health reporting
     # 1. UPDATED _heartbeat_loop METHOD - Comprehensive queue exception handling

@@ -42,7 +42,7 @@ Let me analyze your code and identify the specific bugs that need fixing:
 
 ---
 
-## 🟡3. Error Handling Gaps
+## ✅⏳3. Error Handling Gaps
 
 **✅⏳Issue 3.1: Silent OpenCV Failures**  
 - **Location:** `camera_worker.py` `_sub_stream_loop()`  
@@ -54,7 +54,7 @@ Let me analyze your code and identify the specific bugs that need fixing:
 - **Problem:** Queue operations can raise exceptions that aren't handled  
 - **Impact:** Worker threads may crash silently  
 
-**🟡Issue 3.3: Missing Process Health Monitoring**  
+**✅⏳Issue 3.3: Missing Process Health Monitoring**  
 - **Location:** `camera_worker.py` - no monitoring of FFmpeg subprocess  
 - **Problem:** If FFmpeg dies, worker doesn't know  
 - **Impact:** Recording failures not detected  
@@ -63,12 +63,12 @@ Let me analyze your code and identify the specific bugs that need fixing:
 
 ## 4. Resource Management Bugs
 
-**Issue 4.1: OpenCV VideoCapture Not Released on Error**  
+**✅⏳Issue 4.1: OpenCV VideoCapture Not Released on Error**  
 - **Location:** `camera_worker.py` `_sub_stream_loop()`  
 - **Problem:** `cap.release()` only in `finally`, not on reconnection  
 - **Impact:** Resource leaks on stream errors  
 
-**Issue 4.2: Memory Leak in Frame Queue**  
+**🟡Issue 4.2: Memory Leak in Frame Queue**  
 - **Location:** `ffmpeg_recorder.py` - frame queue grows unbounded during errors  
 - **Problem:** If `write_queue` blocks, memory usage grows  
 - **Impact:** Worker memory exhaustion  
