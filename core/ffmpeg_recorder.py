@@ -9,8 +9,9 @@ import time
 import os
 from datetime import datetime
 from config.ui_constants import FFMPEG_LOG_FILE
-from core.logger_config import logger
+from core.logger_config import get_logger
 
+logger = get_logger(__name__)  # __name__ will be the module’s name
 
 class FFmpegRecorder:
     def __init__(self, url, output_file, pre_record_time, fps, frame_size):
@@ -35,7 +36,7 @@ class FFmpegRecorder:
         self.max_restarts = 3
         self.recording_failed = False  # Flag to indicate recording failure
         
-        logger.info(f"[FFmpegRecorder] Initialized with frame_size={self.frame_size}")
+        logger.debug(f"[FFmpegRecorder] Initialized with frame_size={self.frame_size}")
 
     def add_frame(self, frame):
         resized = cv2.resize(frame, self.frame_size)
@@ -53,7 +54,7 @@ class FFmpegRecorder:
             if self.recording:
                 return
                 
-            logger.info(f"[Recorder] Starting recording @{self.fps} fps...")
+            logger.debug(f"[Recorder] Starting recording @{self.fps} fps...")
             
             # Reset state
             self.recording_failed = False
@@ -78,7 +79,7 @@ class FFmpegRecorder:
             self.monitor_thread.start()
             
             self.recording = True
-            logger.info(f"[Recorder] Recording started with process monitoring (PID: {self.process.pid})")
+            logger.debug(f"[Recorder] Recording started with process monitoring (PID: {self.process.pid})")
 
     def _start_ffmpeg_process(self):
         """Start FFmpeg process with error handling."""
@@ -87,7 +88,14 @@ class FFmpegRecorder:
             cmd = [
                 "ffmpeg",
                 "-y",
-                "-rtsp_transport", "tcp",
+                # "-rtsp_transport", "tcp",
+                "-rtsp_transport", "udp",
+                # "-fflags", "low_delay",
+                "-probesize", "500000",
+                "-analyzeduration", "5000000",
+                # "-framedrop",
+                "-max_delay", "5000000",
+                # "-bufsize", "1M",
                 "-i", self.url,
                 "-an",
                 "-c:v", "libx264", 
@@ -113,7 +121,7 @@ class FFmpegRecorder:
                 except queue.Full:
                     logger.warning("[FFmpegRecorder] Write queue full during prebuffer")
             
-            logger.info(f"[FFmpeg] Process started successfully (PID: {self.process.pid})")
+            logger.debug(f"[FFmpeg] Process started successfully (PID: {self.process.pid})")
             return True
             
         except Exception as e:
@@ -122,7 +130,7 @@ class FFmpegRecorder:
 
     def _monitor_ffmpeg_process(self):
         """Monitor FFmpeg process health and handle failures."""
-        logger.info(f"[FFmpeg Monitor] Starting process monitoring for PID: {self.process.pid}")
+        logger.debug(f"[FFmpeg Monitor] Starting process monitoring for PID: {self.process.pid}")
         
         while not self.stop_monitor_event.wait(2.0):  # Check every 2 seconds
             try:
@@ -165,7 +173,7 @@ class FFmpegRecorder:
                 logger.warning("[FFmpeg Monitor] Marking recording as failed due to process exit")
                 self.recording_failed = True
                 
-        logger.info("[FFmpeg Monitor] Process monitoring stopped")
+        logger.debug("[FFmpeg Monitor] Process monitoring stopped")
 
     def _restart_ffmpeg_process(self):
         """Restart FFmpeg process after failure."""
@@ -253,9 +261,11 @@ class FFmpegRecorder:
                 logger.error(f"[Writer] Writer loop error: {e}")
                 break
 
-    def stop_recording(self):
-        """Stop recording with monitoring cleanup."""
-        logger.info("[Recorder] Stopping recording...")
+    # ffmpeg_recorder.py - Enhanced FFmpeg Shutdown for Stream Disconnection Fix
+
+    def stop_recording(self, force_immediate=False):
+        """Stop FFmpeg recording with enhanced shutdown logic for stream disconnections."""
+        logger.debug("[Recorder] Stopping recording...")
         
         with self.lock:
             if not self.recording:
@@ -274,40 +284,189 @@ class FFmpegRecorder:
             self.writer_thread.join(timeout=2.0)
             self.writer_thread = None
             
-        # Graceful FFmpeg shutdown (keep existing logic)
+        # Enhanced FFmpeg shutdown with stream disconnection awareness
         try:
             if self.process and self.process.poll() is None:
-                logger.info("[Recorder] Sending 'q' command for graceful shutdown...")
+                # Check if we should attempt graceful shutdown or force immediate termination
+                should_force_immediate = force_immediate or self._should_force_immediate_shutdown()
                 
-                try:
-                    self.process.stdin.write(b'q\n')
-                    self.process.stdin.flush()
-                    exit_code = self.process.wait(timeout=10)
-                    logger.info(f"[Recorder] FFmpeg finished gracefully (exit code: {exit_code})")
+                if should_force_immediate:
+                    logger.warning("[Recorder] Stream likely disconnected, forcing immediate FFmpeg termination")
+                    self._force_immediate_shutdown()
+                else:
+                    logger.debug("[Recorder] Attempting graceful FFmpeg shutdown...")
+                    self._attempt_graceful_shutdown()
                     
-                except subprocess.TimeoutExpired:
-                    logger.warning("[Recorder] Graceful shutdown timeout, terminating...")
-                    self.process.terminate()
-                    self.process.wait(timeout=5)
-                    
-                except Exception as e:
-                    logger.warning(f"[Recorder] Graceful shutdown error: {e}")
-                    self.process.terminate()
-                    self.process.wait(timeout=5)
-                    
-                finally:
-                    try:
-                        if self.process.stdin:
-                            self.process.stdin.close()
-                    except:
-                        pass
-                        
+            else:
+                logger.debug("[Recorder] FFmpeg process already terminated")
+                
         except Exception as e:
-            logger.error(f"[Recorder] Error stopping: {e}")
+            logger.error(f"[Recorder] Error during FFmpeg shutdown: {e}")
+            # Always ensure process is terminated
+            self._force_immediate_shutdown()
             
         finally:
             self.process = None
-            logger.info(f"[Recorder] Recording stopped. Restarts: {self.restart_count}, Dropped frames: {self.dropped_frames}")
+            logger.debug(f"[Recorder] Recording stopped. Restarts: {self.restart_count}, Dropped frames: {self.dropped_frames}")
+
+
+    def _should_force_immediate_shutdown(self) -> bool:
+        """
+        Determine if FFmpeg shutdown should be immediate rather than graceful.
+        
+        Returns:
+            True if immediate shutdown is recommended
+        """
+        try:
+            # Check if process is responsive by testing stdin
+            if not self.process or not self.process.stdin:
+                return True
+                
+            # If we have high restart count, FFmpeg may be in bad state
+            if self.restart_count > 0:
+                logger.warning("[Recorder] High restart count detected, using immediate shutdown")
+                return True
+            
+            # Check if writer thread had recent errors (broken pipe indicates stream issues)
+            # This would be detected by checking if write_queue has been backing up
+            try:
+
+                queue_size = self.write_queue.qsize()
+                if queue_size > 50:  # If queue is backing up significantly
+                    logger.warning(f"[Recorder] Write queue backed up ({queue_size} frames), using immediate shutdown")
+                    return True
+            except:
+                pass
+            
+            # Test if stdin is still writable (quick test)
+            try:
+
+                if os.name is "posix": #and os.name is not "nt":
+                    import select
+                    import sys
+
+                    if hasattr(select, 'select'):  # Unix-like systems
+                        ready, _, _ = select.select([], [self.process.stdin], [], 0)
+                        if not ready:  # stdin not ready for writing
+                            logger.warning("[Recorder] FFmpeg stdin not ready, using immediate shutdown")
+                            return True
+
+                # On Windows, we'll use a timeout-based approach instead
+                if os.name is "nt":
+                    # Windows: try a non-blocking write to check
+                    try:
+                        self.process.stdin.write(b"")
+                        self.process.stdin.flush()
+
+                    except Exception as e:
+                        logger.error(f"[Recorder] Windows stdin not writable: {e}")
+                        return True
+
+            except:
+                # If we can't test stdin, be safe and use immediate shutdown
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.critical(f"[Recorder] Error checking shutdown method: {e}")
+            return True  # Default to immediate shutdown on errors
+
+    def _attempt_graceful_shutdown(self):
+        """Attempt graceful FFmpeg shutdown with shorter timeout for stream disconnections."""
+        try:
+            # Send 'q' command for graceful shutdown
+            logger.debug("[Recorder] Sending 'q' command to FFmpeg...")
+            self.process.stdin.write(b'q\n')
+            self.process.stdin.flush()
+            
+            # Use shorter timeout for graceful shutdown (3 seconds instead of 10)
+            # This prevents long waits when stream is disconnected
+            logger.debug("[Recorder] Waiting for graceful shutdown (3s timeout)...")
+            exit_code = self.process.wait(timeout=3.0)
+            logger.debug(f"[Recorder] FFmpeg finished gracefully (exit code: {exit_code})")
+        except subprocess.TimeoutExpired:
+            logger.warning("[Recorder] Graceful shutdown timeout (3s), terminating...")
+            self._terminate_with_timeout()
+            
+        except (BrokenPipeError, OSError) as e:
+            # These errors indicate the stream/process is already in bad state
+            logger.warning(f"[Recorder] Process already unresponsive ({e}), terminating immediately")
+            self._terminate_with_timeout()
+            
+        except Exception as e:
+            logger.error(f"[Recorder] Error during graceful shutdown: {e}")
+            self._terminate_with_timeout()
+            
+        finally:
+            # Always close stdin to prevent resource leaks
+            try:
+                if self.process and self.process.stdin:
+                    self.process.stdin.close()
+            except:
+                pass
+
+    def _force_immediate_shutdown(self):
+        """Force immediate FFmpeg termination without attempting graceful shutdown."""
+        try:
+            if not self.process:
+                return
+                
+            logger.debug("[Recorder] Forcing immediate FFmpeg termination...")
+            
+            # Close stdin first to break any blocking operations
+            try:
+                if self.process.stdin:
+                    self.process.stdin.close()
+            except:
+                pass
+                
+            # Terminate immediately
+            self.process.terminate()
+            
+            # Wait briefly for termination
+            try:
+                exit_code = self.process.wait(timeout=2.0)
+                logger.info(f"[Recorder] FFmpeg terminated immediately (exit code: {exit_code})")
+            except subprocess.TimeoutExpired:
+                logger.warning("[Recorder] Termination timeout, force killing...")
+                self.process.kill()
+                self.process.wait()  # This should not timeout after kill
+                logger.info("[Recorder] FFmpeg force killed")
+                
+        except Exception as e:
+            logger.error(f"[Recorder] Error during immediate shutdown: {e}")
+            # Last resort - try kill
+            try:
+                if self.process:
+                    self.process.kill()
+                    self.process.wait()
+            except:
+                pass
+
+    def _terminate_with_timeout(self):
+        """Terminate FFmpeg with timeout and fallback to kill."""
+        try:
+            self.process.terminate()
+            
+            # Wait for termination with short timeout
+            exit_code = self.process.wait(timeout=2.0)
+            logger.info(f"[Recorder] FFmpeg terminated (exit code: {exit_code})")
+            
+        except subprocess.TimeoutExpired:
+            logger.warning("[Recorder] Termination timeout, force killing...")
+            try:
+                self.process.kill()
+                self.process.wait()  # This should not timeout after kill
+                logger.info("[Recorder] FFmpeg force killed")
+            except Exception as e:
+                logger.error(f"[Recorder] Error during force kill: {e}")
+
+    # Enhanced method for camera worker integration
+    def stop_recording_immediate(self):
+        """Stop recording with immediate termination - for use during stream failures."""
+        self.stop_recording(force_immediate=True)        
+
 
     # Keep existing utility methods
     def get_dropped_frames(self):
@@ -318,3 +477,5 @@ class FFmpegRecorder:
 
     def get_dropped_frame_count(self):
         return self.dropped_frames
+
+        

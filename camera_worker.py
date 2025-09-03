@@ -12,21 +12,24 @@ from datetime import datetime
 import multiprocessing as mp
 import queue
 
-from core.logger_config import logger
 from core.camera_helper import CameraHelper
 from core.ffmpeg_recorder import FFmpegRecorder
 from core.motion_detector import detect_motion, preprocess_frame
 from supervisor import HeartbeatMessage, CommandMessage
 
+from core.logger_config import get_logger
+logger = get_logger()  # Will show [camera_worker] in logs
 
 class CameraWorker:
     """Camera worker process that handles SUB stream (preview + motion) and MAIN stream (recording)."""
-    
-    
     # camera_worker.py - Motion Trigger Race Condition Fix
 
     # 1. UPDATED __init__ METHOD - Add motion trigger state tracking
+    # 1. UPDATED __init__ METHOD - Add stream health tracking for recording
     def __init__(self, camera_id: str, cmd_queue: mp.Queue, status_queue: mp.Queue):
+        global logger
+        logger = get_logger(f'camera_worker.{camera_id}')
+
         self.camera_id = camera_id
         self.cmd_queue = cmd_queue
         self.status_queue = status_queue
@@ -66,6 +69,12 @@ class CameraWorker:
         self.motion_trigger_sent = False  # Track if recording event already triggered
         self.last_motion_trigger_time = 0.0  # Debounce rapid triggers
         self.motion_trigger_cooldown = 2.0  # Minimum seconds between triggers
+        
+        # Stream health tracking for recording control (NEW)
+        self.stream_health_failures = 0  # Track consecutive stream failures during recording
+        self.max_stream_failures_during_recording = 3  # Stop recording after 3 consecutive failures
+        self.last_valid_stream_time = time.time()  # Track when stream was last healthy
+        self.max_stream_downtime_during_recording = 30.0  # Stop recording after 30s of stream issues
         
         # Recording
         self.recorder: Optional[FFmpegRecorder] = None
@@ -288,8 +297,10 @@ class CameraWorker:
         logger.info(f"Command loop stopped for {self.camera_id}")
 
     # 2. UPDATED _sub_stream_loop METHOD - Enhanced with frame validation and health monitoring
+    # 4. UPDATED _sub_stream_loop METHOD - Enhanced error reporting for recording awareness
     def _sub_stream_loop(self):
-        """SUB stream thread - enhanced with frame validation and silent failure detection."""
+        # """SUB stream thread - enhanced with frame validation and silent failure detection."""
+        # """SUB stream thread - enhanced with recording-aware error reporting."""
         logger.info(f"Starting SUB stream loop for {self.camera_id} (preview and motion detection)")
         
         cap = None
@@ -299,7 +310,7 @@ class CameraWorker:
         
         # Connection tracking
         connection_failures = 0
-        max_connection_failures = 5
+        max_connection_failures = 15
         last_connection_attempt = 0
         reconnection_delay = 5.0
         max_reconnection_delay = 60.0
@@ -323,7 +334,10 @@ class CameraWorker:
                 if current_time - last_health_check >= health_check_interval:
                     is_healthy, health_message = self._assess_stream_health()
                     if not is_healthy:
-                        logger.warning(f"Stream health issue for {self.camera_id}: {health_message}")
+                        # Enhanced logging for recording awareness
+                        recording_status = "during recording" if self._is_recording() else "while idle"
+                        logger.warning(f"Stream health issue for {self.camera_id} {recording_status}: {health_message}")
+	                    
                         # Force reconnection on persistent health issues
                         if cap:
                             logger.info(f"Forcing reconnection due to health issues for {self.camera_id}")
@@ -358,12 +372,14 @@ class CameraWorker:
 
                     if not url:
                         connection_failures += 1
-                        logger.error(f"Both MAIN and SUB streams unreachable for Camera {self.camera_id} (failures: {connection_failures}/{max_connection_failures})")
+                        # Enhanced error reporting with recording awareness
+                        recording_context = " (RECORDING ACTIVE - may stop soon)" if self._is_recording() else ""
+                        logger.critical(f"Both MAIN and SUB streams unreachable for Camera {self.camera_id} (failures: {connection_failures}/{max_connection_failures}){recording_context}")
                         
                         # Report error to supervisor via heartbeat
                         with self.lock:
-                            self.error_message = f"No valid camera URL (failures: {connection_failures})"
-                        
+                            self.error_message = f"Both MAIN and SUB streams unreachable (failures: {connection_failures})"
+
                         if connection_failures >= max_connection_failures:
                             logger.critical(f"Max connection failures reached for {self.camera_id}, stopping SUB stream")
                             with self.lock:
@@ -375,7 +391,7 @@ class CameraWorker:
                         time.sleep(reconnection_delay)
                         continue
                     
-                    # Attempt connection
+	                # Attempt connection (rest of the connection logic remains the same)
                     try:
                         cap = cv2.VideoCapture(url)
                         if not cap.isOpened():
@@ -428,6 +444,7 @@ class CameraWorker:
                         time.sleep(reconnection_delay)
                         continue
                 
+	            # Frame reading and processing logic (unchanged from previous implementation)
                 # Read frame from established connection
                 ret, frame = cap.read()
                 self.total_frames_processed += 1
@@ -495,7 +512,7 @@ class CameraWorker:
                     frame_count = 0
                     last_fps_time = current_time
                 
-                # Motion detection with atomic trigger logic (unchanged from previous fix)
+	            # Motion detection with atomic trigger logic (unchanged from previous implementation)
                 gray = preprocess_frame(frame)
                 if prev_frame is not None:
                     motion = detect_motion(
@@ -676,8 +693,9 @@ class CameraWorker:
 
     # camera_worker.py - Event Coordination Fix - Updated Methods
     # 1. UPDATED _main_stream_loop METHOD - Enhanced event coordination
+    # 3. UPDATED _main_stream_loop METHOD - Enhanced with stream health monitoring
     def _main_stream_loop(self):
-        """MAIN stream thread - handles recording with improved event coordination."""
+        """MAIN stream thread - handles recording with stream health monitoring."""
         logger.info(f"Starting MAIN stream loop for {self.camera_id}")
         
         try:
@@ -704,9 +722,14 @@ class CameraWorker:
                         # Clear stop event before starting recording loop
                         self.stop_recording_event.clear()
                         
+                        # Reset stream health tracking for new recording session
+                        self.stream_health_failures = 0
+                        self.last_valid_stream_time = time.time()
+                        
                         # Record until stop conditions met
                         recording_start_time = time.time()
                         last_health_check = time.time()
+                        last_stream_health_check = time.time()
                         
                         while (self.running and 
                             self._is_recording()):
@@ -725,6 +748,26 @@ class CameraWorker:
                                     break
                                 
                                 last_health_check = current_time
+                            
+                            # Stream health monitoring (every 5 seconds during recording)
+                            if current_time - last_stream_health_check >= 5.0:
+                                is_stream_healthy, health_reason = self._is_stream_healthy_for_recording()
+                                
+                                if not is_stream_healthy:
+                                    logger.warning(f"Stream unhealthy during recording for {self.camera_id}: {health_reason}")
+                                    self.stream_health_failures += 1
+                                    
+                                    # Stop recording if too many consecutive stream failures
+                                    if self.stream_health_failures >= self.max_stream_failures_during_recording:
+                                        logger.error(f"Stopping recording for {self.camera_id} due to persistent stream issues: {health_reason}")
+                                        break
+                                else:
+                                    # Stream is healthy - reset failure count
+                                    if self.stream_health_failures > 0:
+                                        logger.info(f"Stream health recovered for {self.camera_id} during recording")
+                                    self.stream_health_failures = 0
+                                
+                                last_stream_health_check = current_time
                             
                             # Auto-stop logic with thread-safe access
                             recording_duration = self._get_recording_duration()
@@ -1053,6 +1096,66 @@ class CameraWorker:
         except Exception as e:
             return False, f"Health assessment error: {str(e)[:50]}"
 
+    # 2. NEW HELPER METHOD - Check if SUB stream is healthy enough to continue recording
+    def _is_stream_healthy_for_recording(self) -> tuple[bool, str]:
+        """
+        Check if SUB stream is healthy enough to continue recording.
+        
+        Returns:
+            (is_healthy, reason_if_unhealthy)
+        """
+        try:
+            current_time = time.time()
+            
+            # Check if we have recent valid frames (FPS > 0)
+            with self.lock:
+                current_fps = self.last_fps
+                current_error = self.error_message
+            
+            # Check for stream errors
+            if current_error:
+                # Critical errors that should stop recording immediately
+                critical_errors = [
+                    "Max connection failures reached",
+                    "Both MAIN and SUB streams unreachable"
+                ]
+                
+                for critical_error in critical_errors:
+                    if critical_error in current_error:
+                        return False, f"Critical stream error: {current_error}"
+            
+            # Check FPS health
+            expected_fps = self.camera_config.get('fps', 15)
+            min_recording_fps = expected_fps * 0.2  # 20% of expected FPS minimum for recording
+            
+            if current_fps < min_recording_fps:
+                stream_downtime = current_time - self.last_valid_stream_time
+                
+                # Update last valid stream time if FPS is acceptable
+                if current_fps >= min_recording_fps:
+                    self.last_valid_stream_time = current_time
+                    self.stream_health_failures = 0  # Reset failure count
+                
+                # Check if stream has been down too long
+                if stream_downtime > self.max_stream_downtime_during_recording:
+                    return False, f"Stream down for {stream_downtime:.1f}s (max: {self.max_stream_downtime_during_recording}s)"
+            else:
+                # Stream is healthy - reset counters
+                self.last_valid_stream_time = current_time
+                self.stream_health_failures = 0
+            
+            # Check consecutive failure count
+            if hasattr(self, 'total_frames_processed') and hasattr(self, 'frame_validation_failures'):
+                if self.total_frames_processed > 100:  # Only check after some frames processed
+                    recent_failure_rate = self.frame_validation_failures / self.total_frames_processed
+                    if recent_failure_rate > 0.5:  # More than 50% failures
+                        return False, f"High frame failure rate: {recent_failure_rate:.1%}"
+            
+            return True, "Stream healthy"
+            
+        except Exception as e:
+            return False, f"Health check error: {str(e)[:50]}"
+        
 # For testing/debugging - can run worker standalone
 if __name__ == "__main__":
     import sys
