@@ -326,11 +326,15 @@ def _setup_shared_handlers(config: Union[dict, Any]) -> list:
     date_format = getattr(log_config, 'datefmt', None) or log_config.get('datefmt', '%Y-%m-%d %H:%M:%S')
     
     formatter = logging.Formatter(log_format, datefmt=date_format)
-    
+
+    level_str = getattr(log_config, 'level', None) or log_config.get('level', 'INFO')
+    level = getattr(logging, level_str)
+
     # Console handler
     if console_enabled:
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
+        console_handler.setLevel(level)
         handlers.append(console_handler)
     
     # File handler
@@ -360,6 +364,7 @@ def _setup_shared_handlers(config: Union[dict, Any]) -> list:
             file_handler = logging.FileHandler(log_path)
         
         file_handler.setFormatter(formatter)
+        file_handler.setLevel(level)
         handlers.append(file_handler)
     
     return handlers
