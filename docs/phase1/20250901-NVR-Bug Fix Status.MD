@@ -68,21 +68,21 @@ Let me analyze your code and identify the specific bugs that need fixing:
 - **Problem:** `cap.release()` only in `finally`, not on reconnection  
 - **Impact:** Resource leaks on stream errors  
 
-**🟡Issue 4.2: Memory Leak in Frame Queue**  
+**✅⏳Issue 4.2: Memory Leak in Frame Queue**  
 - **Location:** `ffmpeg_recorder.py` - frame queue grows unbounded during errors  
 - **Problem:** If `write_queue` blocks, memory usage grows  
 - **Impact:** Worker memory exhaustion  
 
 ---
 
-## 5. Motion Detection State Bugs
+## ✅⏳5. Motion Detection State Bugs
 
-**Issue 5.1: Complex State Management**  
+**✅⏳Issue 5.1: Complex State Management**  
 - **Location:** `motion_detector.py` - multiple overlapping state variables  
 - **Problem:** Debug prints in production, complex state transitions  
 - **Impact:** Difficult to debug motion detection issues  
 
-**Issue 5.2: Timer Precision Issues**  
+**✅⏳Issue 5.2: Timer Precision Issues**  
 - **Location:** Motion timeout logic uses floating point comparisons  
 - **Problem:** Potential timing edge cases  
 - **Impact:** Inconsistent motion confirmation  
