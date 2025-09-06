@@ -1,3 +1,5 @@
+# core/config_manager.py
+
 from pathlib import Path
 from core.app_config import AppConfig
 

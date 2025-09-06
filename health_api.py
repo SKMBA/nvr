@@ -2,8 +2,9 @@
 from flask import Flask, jsonify
 import threading
 from typing import Optional
-from core.logger_config import logger
 
+from core.logger_config import get_logger
+logger = get_logger()  
 
 class HealthAPI:
     """Simple Flask API to expose supervisor and worker health status."""

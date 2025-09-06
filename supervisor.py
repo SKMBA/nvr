@@ -11,10 +11,11 @@ import signal
 import sys
 import os
 
-from core.logger_config import logger
 from core.camera_helper import CameraHelper
 from core.config_validator import ConfigValidator, ConfigValidationError
 
+from core.logger_config import get_logger
+logger = get_logger()  # Will show [supervisor] in logs
 
 class WorkerState(Enum):
     STARTING = "starting"

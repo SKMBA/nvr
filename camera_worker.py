@@ -33,6 +33,7 @@ class CameraWorker:
         self.camera_id = camera_id 
         self.cmd_queue = cmd_queue 
         self.status_queue = status_queue 
+        self.output_folder = "recordings"
         
         # Camera configuration
         self.camera_config = CameraHelper.get_camera_by_id(camera_id)
@@ -1012,7 +1013,7 @@ class CameraWorker:
                 
             # Create output filename
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_file = f"output/{self.camera_id}_{timestamp}.mp4"
+            output_file = f"{self.output_folder}/{self.camera_id}_{timestamp}.mp4"
             os.makedirs(os.path.dirname(output_file), exist_ok=True)
             
             # Initialize recorder
